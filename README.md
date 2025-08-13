@@ -1,146 +1,183 @@
-# Documentação dos scripts
+Gmail Threads Dumper — Documentação do Projeto
+==============================================
 
-## 1. google_apis.py
+Este repositório implementa um MVP simples e modular para:
+1) Autenticar no Gmail via OAuth;
+2) Listar rótulos (labels) da caixa de entrada (teste rápido);
+3) Buscar mensagens por rótulo e/ou consulta (`--q`), agrupar por thread e salvar **1 JSON por thread** em `raw_messages/`.
 
-Módulo genérico para autenticar e criar instâncias de clientes das APIs do Google usando OAuth 2.0.
+-------------------------------------------------------------------------------
+1) Estrutura de Pastas e Papéis de Cada Arquivo
+-------------------------------------------------------------------------------
 
-### Dependências
-Instalação:
-    pip install -r requirements.txt
-
-### Organização de arquivos
-- credentials/credentials-parrots-gmail.json  
-  → JSON de credenciais OAuth 2.0 obtido no Google Cloud Console  
-- token_files/  
-  → Pasta onde serão armazenados tokens de acesso atualizados automaticamente  
-
-### Função create_service(api_name, api_version, scopes, prefix='')
-1. Define:
-   - CLIENT_SECRET_FILE  
-     Caminho para o arquivo de credenciais (dentro de `credentials/`)
-   - token_file  
-     Nome padrão: `token_<API>_<VERSÃO><prefix>.json`  
-   - token_path  
-     Caminho completo dentro de `token_files/`
-
-2. Carregamento de credenciais:
-   - Se `token_path` existir, carrega credenciais via `Credentials.from_authorized_user_file()`.  
-   - Se não houver credenciais válidas ou elas estiverem expiradas:
-     - Se existir `refresh_token`, faz `creds.refresh(Request())`.  
-     - Caso contrário, inicia fluxo OAuth local com  
-       `InstalledAppFlow.from_client_secrets_file(...).run_local_server()`.
-
-3. Salvamento de credenciais:
-   - Grava JSON de `creds` em `token_path` para usos futuros.
-
-4. Criação do serviço:
-   - Chama `build(api_name, api_version, credentials=creds, static_discovery=False)`.  
-   - Em caso de sucesso, imprime  
-     `"<API> <VERSÃO> service created successfully"` e retorna o objeto `service`.  
-   - Se falhar, remove `token_path` (para evitar credenciais corrompidas) e retorna `None`.
-
-
-### prompt
-
-You are an expert AI agent specializing in extracting structured information from email correspondence related to hotel bookings and quotations. Your task is to meticulously read the provided email excerpts and extract the following information. Present the output in a JSON format. If a piece of information is not explicitly found, state "N/A" for that field. If there are contradictions or ambiguities across different emails in the thread, note them clearly and prioritize the latest confirmed information for quotation details where applicable.
-Extraction Fields:
-1. Email_Basics:
-    ◦ Timestamp: Extract the full date and time the email was sent or received. (e.g., "Wed, May 28, 2025 at 1:22 PM").
-    ◦ Sender: Identify the sender's name and email address for each distinct email in the thread..
-    ◦ Recipient: Identify the primary recipient's name and email address for each distinct email in the thread..
-    ◦ Subject: Extract the main subject line of the email thread..
-2. Hotel_Data:
-    ◦ Hotel_Name: The full name of the hotel mentioned..
-    ◦ City: The city where the hotel is located..
-3. Quotation_Data:
-    ◦ Number_of_Rooms_Quoted: The total number of rooms/apartments specified in the final quotation..
-    ◦ Room_Configurations: List all room configurations mentioned (e.g., 'twin', 'double', 'SGL/DBL', 'Triplo')..
-    ◦ Room_Types: List the specific types of rooms offered (e.g., 'Standard', 'Triplo')..
-    ◦ Price_Per_Room_Type: For each room type and configuration, extract the price per day and any associated percentage or tax (e.g., R$ 900,00 + 5% ISS). Specify if it's per day per apartment..
-    ◦ Rate_Type: Determine if the rate is 'NET' or 'Commissioned'..
-    ◦ Taxes_Included: Identify any taxes mentioned (e.g., '5% de ISS') and explicitly state if the total value includes these taxes..
-    ◦ Included_Services: List all services explicitly stated as included in the price (e.g., 'café da manhã', 'internet wi-fi'). Provide the exact phrasing from the source for these services..
-    ◦ Stay_Dates: Extract the check-in and check-out dates, including the year, and the total number of nights. Also, extract the specific check-in and check-out times. Note any discrepancies or clarifications regarding the dates mentioned across the sources..
-    ◦ Payment_Policy: Detail the payment terms. Include payment methods (e.g., 'cartão de crédito', 'depósito bancário/PIX'), payment deadlines, and the percentage of the total due at each deadline. Mention if a payment link is available..
-    ◦ Cancellation_Policy: Describe the cancellation terms. Include deadlines and whether the tariff is refundable or non-refundable after payment/deadline. Note any conditions for cancellation..
-    ◦ Total_Quotation_Value: Extract the total value of the quotation if provided, and note what it includes (e.g., ISS)..
-Output Format Example (JSON):
-{
-  "email_basics": [
-    {
-      "timestamp": "Wed, May 28, 2025 at 1:22 PM",
-      "sender": "Mar Ipanema <maripanema@maripanema.com>",
-      "recipient": "Vitor Sanches <sanches@parrottrips.com>",
-      "subject": "Parrot Trips | Rio de Janeiro | Mar Ipanema | Reveillon"
-    },
-    {
-      "timestamp": "On Thu, May 22, 2025 at 4:51 PM",
-      "sender": "Mar Ipanema <maripanema@maripanema.com>",
-      "recipient": "Vitor Sanches <sanches@parrottrips.com>",
-      "subject": "Parrot Trips | Rio de Janeiro | Mar Ipanema | Reveillon"
-    }
-    // ... include details for all relevant emails in the thread
-  ],
-  "hotel_data": {
-    "hotel_name": "Mar Ipanema Hotel",
-    "city": "Rio de Janeiro"
-  },
-  "quotation_data": {
-    "number_of_rooms_quoted": "20 apartamentos",
-    "room_configurations": [
-      "Standard (dbl twin)",
-      "Standard SGL/DBL",
-      "Triplo"
-    ],
-    "room_types": [
-      "Standard",
-      "Triplo"
-    ],
-    "price_per_room_type": [
-      {"type": "Standard (dbl twin)", "price": "R$ 900,00 + 5% (por dia e por apartamento)"},
-      {"type": "Standard SGL/DBL", "price": "R$ 900,00 + 5% ISS (por dia e por apartamento)"},
-      {"type": "Triplo", "price": "R$ 1.215,00 + 5% ISS (por dia e por apartamento)", "availability_notes": "3 unidades disponíveis"}
-    ],
-    "rate_type": "Tarifa NET",
-    "taxes_included": "5% ISS (Total value com ISS incluso)",
-    "included_services": [
-      "café da manhã + internet wi-fi",
-      "café da manhã em estilo bufê, servido no restaurante do Hotel e acesso cortesia à internet wi-fi"
-    ],
-    "stay_dates": {
-      "check_in_date": "21/11/2025",
-      "check_out_date": "24/11/2025",
-      "number_of_nights": "3 noites",
-      "check_in_time": "14h",
-      "check_out_time": "12h",
-      "notes": "Initial date in source [1] appears to be a typo: '24/11 a 24/11 (3 noites)'. Confirmed as 21/11 to 24/11 in [3] and [5]."
-    },
-    "payment_policy": {
-      "methods": "cartão de crédito ou depósito bancário/PIX",
-      "link_available": "Sim, Temos link de pagamento.",
-      "installments": [
-        {"percentage": "50% do total", "deadline": "22/09/2025", "notes": "tarifa não reembolsável"},
-        {"percentage": "50% restantes", "deadline": "21/10/2025", "notes": "tarifa não reembolsável"}
-      ]
-    },
-    "cancellation_policy": {
-      "deadline": "Até o dia 22/09/2025",
-      "terms": "Após o pagamento, a tarifa é não reembolsável. Não havendo o pagamento até o prazo estipulado, considerar a reserva cancelada."
-    },
-    "total_quotation_value": {
-      "total": "R$ 56.700,00",
-      "includes": "ISS"
-    }
-  }
-}
-
-### Exemplo de uso interno em outros scripts
-```python
-from google_apis import create_service
-
-SCOPES = ['https://mail.google.com/']
-service = create_service('gmail', 'v1', SCOPES)
-if not service:
-    print('❌ Falha na autenticação')
+.
+├── credentials/
+│   └── real-credentials-parrots-gmail.json
+│      → Credenciais OAuth do Google obtidas no Google Cloud Console (Client ID/Secret).
+│        Este arquivo é usado apenas localmente para iniciar o fluxo de autorização.
+│
+├── raw_messages/
+│   → Pasta onde serão salvos os JSONs resultantes (um arquivo por thread do Gmail).
+│
+├── token_files/
+│   → Pasta onde ficará o token de acesso/refresh gerado após o primeiro login (OAuth).
+│     O arquivo padrão é `token_gmail_v1.json`. Se apagado, o login será solicitado novamente.
+│
+├── utils/
+│   ├── __init__.py
+│   │  → Arquivo vazio para tornar `utils` um pacote Python importável.
+│   │
+│   ├── mime.py
+│   │  → Funções utilitárias para lidar com MIME:
+│   │     - `get_header(...)`: obtém um header específico (ex.: From, To, Subject).
+│   │     - `extract_prefer_plaintext(...)`: extrai o corpo preferindo `text/plain`; se não existir,
+│   │       converte `text/html` em texto legível (remove scripts/styles e normaliza quebras de linha).
+│   │     - Helpers para decodificar Base64URL e percorrer partes MIME recursivamente.
+│   │
+│   └── gmail_query.py
+│      → Funções para conversar com a Gmail API em alto nível:
+│        - `find_label_id(...)`: resolve o ID de um rótulo pelo nome (ex.: "COMPLETE_DATA").
+│        - `list_messages(...)`: lista mensagens respeitando rótulos, query e paginação.
+│        - `get_thread(...)`: busca o conteúdo completo de uma thread (todas as mensagens).
+│        - `simplify_message(...)`: reduz cada mensagem para um dicionário padrão:
+│          { timestamp (ISO São Paulo), sender, recipient, subject, body }
+│        - `build_gmail_query(...)`: compõe a string de busca (q/after/before).
+│        - `unique_thread_ids(...)`: deduplica mensagens por thread preservando ordem.
+│
+├── requirements.txt
+│  → Lista de dependências do projeto:
+│    google-api-python-client, google-auth, google-auth-oauthlib, beautifulsoup4, python-dateutil, tqdm.
+│
+├── login_gmail.py
+│  → Responsável pela autenticação (OAuth) e criação do cliente Gmail:
+│    - Usa `credentials/real-credentials-parrots-gmail.json` e salva/renova token em `token_files/token_gmail_v1.json`.
+│    - Escopo padrão: `https://www.googleapis.com/auth/gmail.readonly`.
+│
+├── list_labels.py
+│  → Script de verificação rápida:
+│    - Realiza login e imprime todos os rótulos disponíveis da conta (para validar acesso).
+│
+└── dump_threads.py
+   → Script principal de coleta:
+     - Parâmetros:
+       --label "NOME_DO_ROTULO"   (ex.: COMPLETE_DATA)  [opcional]
+       --q     "consulta gmail"   (ex.: from:foo@bar.com has:attachment)  [opcional]
+       --after YYYY/MM/DD         (ex.: 2025/08/01)  [opcional]
+       --before YYYY/MM/DD        (ex.: 2025/08/13)  [opcional]
+       --max   500                (quantidade máx. de mensagens a varrer; não de threads)
+     - Faz a busca, agrupa por thread e salva 1 arquivo JSON por thread em `raw_messages/`.
+     - Converte HTML para texto quando não houver `text/plain`.
 
 
+-------------------------------------------------------------------------------
+2) Pré-requisitos
+-------------------------------------------------------------------------------
+
+- Python 3.10+ (testado no macOS).
+- Ter o arquivo de credenciais OAuth do Google salvo em:
+  `credentials/real-credentials-parrots-gmail.json`
+- A API do Gmail deve estar habilitada no seu projeto do Google Cloud e o OAuth consent configurado.
+
+
+-------------------------------------------------------------------------------
+3) Instalação (primeira vez)
+-------------------------------------------------------------------------------
+
+1. Crie e ative o ambiente virtual:
+   - macOS/Linux:
+     ```
+     python3 -m venv env
+     source env/bin/activate
+     ```
+   - Windows (PowerShell):
+     ```
+     py -m venv env
+     .\env\Scripts\Activate.ps1
+     ```
+
+2. Instale as dependências:
+ ```
+ pip install -r requirements.txt
+ ```
+
+3. Primeiro teste: listar rótulos (labels)
+------------------------------------------
+$ python3 list_labels.py
+
+O que acontece:
+- Na primeira execução, abre-se uma janela do navegador para você autorizar o acesso somente-leitura ao Gmail (escopo: https://www.googleapis.com/auth/gmail.readonly).
+- Ao autorizar, um token é salvo em: token_files/token_gmail_v1.json.
+- Nas próximas execuções, o token é reutilizado e renovado automaticamente sem pedir login.
+- A saída esperada é uma lista de rótulos, por exemplo:
+  📬 Rótulos encontrados:
+   - INBOX
+   - SENT
+   - COMPLETE_DATA
+   - ...
+
+Se quiser forçar um novo login (ou trocar de conta), apague o arquivo:
+  token_files/token_gmail_v1.json
+e rode novamente o list_labels.py.
+
+3) Coleta: salvar 1 JSON por thread (dump)
+------------------------------------------
+Exemplo por rótulo + janela de datas:
+$ python3 dump_threads.py --label COMPLETE_DATA --after 2025/08/01 --before 2025/08/13 --max 200
+
+Exemplo por consulta livre (sem rótulo):
+$ python3 dump_threads.py --q "from:alguem@empresa.com subject:cotação" --max 100
+
+Exemplo combinando rótulo e consulta:
+$ python3 dump_threads.py --label COMPLETE_DATA --q "from:alguem@empresa.com" --max 200
+
+O que acontece:
+- O script monta a busca usando os parâmetros fornecidos:
+  • --label: restringe a mensagens com o rótulo informado (ex.: COMPLETE_DATA).
+  • --q: passa a consulta conforme a sintaxe de busca do Gmail (ex.: from:, to:, subject:, has:attachment, etc.).
+  • --after e --before: filtros de data no formato YYYY/MM/DD (padrão do Gmail).
+    - Regra prática: after:D/ M/ A significa “mais recentes que essa data” (exclusivo).
+      before:D/ M/ A significa “mais antigas que essa data” (exclusivo).
+    - Ex.: after:2025/08/01 AND before:2025/08/13 cobre aproximadamente 2025-08-01 até 2025-08-12.
+  • --max: limita a quantidade de MENSAGENS escaneadas na busca (não é o número final de threads).
+- As mensagens encontradas são agrupadas por threadId.
+- Para cada thread:
+  • Baixa-se o conteúdo completo da thread (todas as mensagens).
+  • Cada mensagem é simplificada para {timestamp, sender, recipient, subject, body}.
+  • O corpo (body) prioriza text/plain; se indisponível, converte-se text/html para texto limpo.
+  • As mensagens são ordenadas cronologicamente.
+  • Gera-se um arquivo JSON por thread em raw_messages/.
+
+4. Onde ver os resultados
+-------------------------
+- Os arquivos são gravados em: raw_messages/
+- Nome do arquivo:
+  YYYYMMDD_HHMM__Nome_Email__Assunto.json
+  • YYYYMMDD_HHMM vem do timestamp da primeira mensagem da thread (timezone São Paulo).
+  • Nome_Email é baseado no header “From”.
+  • Assunto é sanitizado para formar um nome de arquivo seguro.
+- Exemplo para inspecionar rapidamente:
+  $ ls -1 raw_messages | head
+  $ cat raw_messages/20250808_1241__Fulano_fulano@exemplo.com__Assunto.json
+
+5. Fluxo geral (visão resumida)
+-------------------------------
+- login_gmail.py: faz OAuth; cria/renova token; retorna o cliente Gmail autenticado.
+- list_labels.py: sanity check — mostra os rótulos disponíveis.
+- dump_threads.py:
+  1) (Opcional) resolve o ID do rótulo informado.
+  2) Monta a query (q/after/before) para a Gmail API.
+  3) Lista mensagens (até --max), agrupa por threadId.
+  4) Para cada thread, busca conteúdo completo, simplifica mensagens e salva 1 JSON em raw_messages/.
+- utils/mime.py: lida com MIME, headers e conversão HTML→texto.
+- utils/gmail_query.py: utilitários para busca, threads e normalização de mensagens.
+
+6. Exemplos úteis de consultas (parâmetro --q)
+----------------------------------------------
+- Por remetente:
+  --q "from:alguem@empresa.com"
+- Por assunto contendo palavras:
+  --q "subject:cotação"
+- E-mails com anexos:
+  --q "has:attachment"
+- Múltiplas condições:
+  --q "from:alguem@empresa.com subject:paraty has:attachment"

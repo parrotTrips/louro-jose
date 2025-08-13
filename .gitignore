@@ -1,9 +1,18 @@
-/credentials
+# venvs
+env/
+.env
 
-/env
+# Python
+**/__pycache__/
+*.py[cod]
 
-/.env
+# Dotenv
+.env
+.env.*
 
-/token_files
+# Saídas
+raw_messages/
+token_files/
 
-/__pycache__
+# Segredos
+credentials/
