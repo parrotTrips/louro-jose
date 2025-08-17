@@ -1,0 +1,17 @@
+HEADER_FIELDS = [
+    "Timestamp",
+    "Destinatário",
+    "Assunto",
+    "Nome do hotel",
+    "Cidade",
+    "Número de quartos disponível",
+    "Qual configuração do quarto (twin, double)",
+    "Qual tipo de quarto (standard, luxo, superior…)",
+    "Preço por tipo de quarto",
+    "Tarifa NET ou comissionada?",
+    "Taxa? Ex.: 5% de ISS",
+    "Serviços incluso? Explicação: existem hotéis que consideram a tarifa de serviço já incluso e outros não.",
+    "Data da hospedagem",
+    "Política de pagamento",
+    "Política de cancelamento",
+]

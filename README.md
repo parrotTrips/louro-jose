@@ -1,10 +1,13 @@
 Gmail Threads Dumper — Documentação do Projeto
+
 ==============================================
 
 Este repositório implementa um MVP simples e modular para:
-1) Autenticar no Gmail via OAuth;
-2) Listar rótulos (labels) da caixa de entrada (teste rápido);
-3) Buscar mensagens por rótulo e/ou consulta (`--q`), agrupar por thread e salvar **1 JSON por thread** em `raw_messages/`.
+1. Autenticar no Gmail via OAuth;
+2. Listar rótulos (labels) da caixa de entrada (teste rápido);
+3. Buscar mensagens por rótulo e/ou consulta (--q), agrupar por thread e salvar 1 JSON por thread em raw_messages/.
+4. Extrair informações dessas mensagens com uma LLM e enquadrar nos campos do cabeçalho da aba quotes;
+5. Persistir os dados extraídos na planilha do Google Sheets indicada no .env.
 
 -------------------------------------------------------------------------------
 1) Estrutura de Pastas e Papéis de Cada Arquivo
@@ -18,6 +21,11 @@ Este repositório implementa um MVP simples e modular para:
 │
 ├── raw_messages/
 │   → Pasta onde serão salvos os JSONs resultantes (um arquivo por thread do Gmail).
+│
+├── outputs/
+│   → (Novo) Artefatos das fases de extração e persistência:
+│      - quotes_extracted.jsonl  (saída da extração via LLM, 1 JSON por linha)
+│      - quotes_extracted.csv    (opcional, se decidir gerar CSV)
 │
 ├── token_files/
 │   → Pasta onde ficará o token de acesso/refresh gerado após o primeiro login (OAuth).
@@ -34,19 +42,32 @@ Este repositório implementa um MVP simples e modular para:
 │   │       converte `text/html` em texto legível (remove scripts/styles e normaliza quebras de linha).
 │   │     - Helpers para decodificar Base64URL e percorrer partes MIME recursivamente.
 │   │
-│   └── gmail_query.py
-│      → Funções para conversar com a Gmail API em alto nível:
-│        - `find_label_id(...)`: resolve o ID de um rótulo pelo nome (ex.: "COMPLETE_DATA").
-│        - `list_messages(...)`: lista mensagens respeitando rótulos, query e paginação.
-│        - `get_thread(...)`: busca o conteúdo completo de uma thread (todas as mensagens).
-│        - `simplify_message(...)`: reduz cada mensagem para um dicionário padrão:
-│          { timestamp (ISO São Paulo), sender, recipient, subject, body }
-│        - `build_gmail_query(...)`: compõe a string de busca (q/after/before).
-│        - `unique_thread_ids(...)`: deduplica mensagens por thread preservando ordem.
-│
-├── requirements.txt
-│  → Lista de dependências do projeto:
-│    google-api-python-client, google-auth, google-auth-oauthlib, beautifulsoup4, python-dateutil, tqdm.
+│   ├── gmail_query.py
+│   │  → Funções para conversar com a Gmail API em alto nível:
+│   │     - `find_label_id(...)`: resolve o ID de um rótulo pelo nome (ex.: "COMPLETE_DATA").
+│   │     - `list_messages(...)`: lista mensagens respeitando rótulos, query e paginação.
+│   │     - `get_thread(...)`: busca o conteúdo completo de uma thread (todas as mensagens).
+│   │     - `simplify_message(...)`: reduz cada mensagem para um dicionário padrão:
+│   │       { timestamp (ISO São Paulo), sender, recipient, subject, body }
+│   │     - `build_gmail_query(...)`: compõe a string de busca (q/after/before).
+│   │     - `unique_thread_ids(...)`: deduplica mensagens por thread preservando ordem.
+│   │
+│   ├── headers.py
+│   │  → (Novo) Lista **única e ordenada** dos 15 campos do cabeçalho da aba `quotes`.
+│   │
+│   ├── prompt.py
+│   │  → (Novo) Instruções do sistema (`SYSTEM_INSTRUCTIONS`) e gerador de prompt
+│   │     (`build_user_prompt(...)`) para a LLM.
+│   │
+│   ├── text_clean.py
+│   │  → (Novo) Limpeza do corpo do e-mail (remove “forwarded”, cabeçalhos repetidos, links/assinaturas).
+│   │
+│   ├── io_email.py
+│   │  → (Novo) Carrega os JSONs de `raw_messages/` (formato com `emails[0]` ou “flat”)
+│   │     e infere timestamp a partir do nome do arquivo quando necessário.
+│   │
+│   └── json_utils.py
+│      → (Novo) Utilitários genéricos: `force_json_object(...)`, `blank_row(...)`, `ensure_dir(...)`.
 │
 ├── login_gmail.py
 │  → Responsável pela autenticação (OAuth) e criação do cliente Gmail:
@@ -57,26 +78,48 @@ Este repositório implementa um MVP simples e modular para:
 │  → Script de verificação rápida:
 │    - Realiza login e imprime todos os rótulos disponíveis da conta (para validar acesso).
 │
-└── dump_threads.py
-   → Script principal de coleta:
-     - Parâmetros:
-       --label "NOME_DO_ROTULO"   (ex.: COMPLETE_DATA)  [opcional]
-       --q     "consulta gmail"   (ex.: from:foo@bar.com has:attachment)  [opcional]
-       --after YYYY/MM/DD         (ex.: 2025/08/01)  [opcional]
-       --before YYYY/MM/DD        (ex.: 2025/08/13)  [opcional]
-       --max   500                (quantidade máx. de mensagens a varrer; não de threads)
-     - Faz a busca, agrupa por thread e salva 1 arquivo JSON por thread em `raw_messages/`.
-     - Converte HTML para texto quando não houver `text/plain`.
+├── dump_threads.py
+│  → Script principal de coleta:
+│    - Parâmetros:
+│      --label "NOME_DO_ROTULO"   (ex.: COMPLETE_DATA)  [opcional]
+│      --q     "consulta gmail"   (ex.: from:foo@bar.com has:attachment)  [opcional]
+│      --after YYYY/MM/DD         (ex.: 2025/08/01)  [opcional]
+│      --before YYYY/MM/DD        (ex.: 2025/08/13)  [opcional]
+│      --max   500                (quantidade máx. de mensagens a varrer; não de threads)
+│    - Faz a busca, agrupa por thread e salva 1 arquivo JSON por thread em `raw_messages/`.
+│    - Converte HTML para texto quando não houver `text/plain`.
+│
+├── llm_extract_quotes.py
+│  → (Novo) **Fase 1** — Extração via LLM:
+│    - Lê `raw_messages/*.json`, limpa o corpo e chama o Gemini (API Key no `.env`).
+│    - Enquadra os dados **exatamente** nos 15 campos da aba `quotes`.
+│    - Salva `outputs/quotes_extracted.jsonl` (um objeto JSON por linha).
+│
+└── save_quotes_to_csv.py
+   → (Novo) **Fase 2** — Persistência:
+     - Lê `outputs/quotes_extracted.jsonl` e **faz append na aba `quotes`** da planilha
+       indicada por `SHEET_ID` (no `.env`) usando `utils/login_sheets`.
+     - (Opcional) pode ser adaptado para também gerar `outputs/quotes_extracted.csv`.
+
 
 
 -------------------------------------------------------------------------------
 2) Pré-requisitos
 -------------------------------------------------------------------------------
 
-- Python 3.10+ (testado no macOS).
 - Ter o arquivo de credenciais OAuth do Google salvo em:
   `credentials/real-credentials-parrots-gmail.json`
-- A API do Gmail deve estar habilitada no seu projeto do Google Cloud e o OAuth consent configurado.
+- Ter credentials/sheets-parrots.json
+- Ter um GEMINI_API_KEY no arquivo dotenv
+
+Variáveis de ambiente:
+
+# LLM (Gemini)
+GEMINI_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+GEMINI_MODEL_NAME=gemini-1.5-flash   # opcional (pode usar gemini-1.5-pro)
+
+# Google Sheets
+SHEET_ID=1AbCDeFGhiJKlmnOPqRS_tuvWxYZ1234567890
 
 
 -------------------------------------------------------------------------------
@@ -181,3 +224,33 @@ O que acontece:
   --q "has:attachment"
 - Múltiplas condições:
   --q "from:alguem@empresa.com subject:paraty has:attachment"
+
+7. Fase 1 — Extração via LLM (Gemini)
+-------------------------------------
+Execução:
+`$ python3 llm_extract_quotes.py`
+
+O que acontece:
+
+- Para cada arquivo em raw_messages/, o corpo é higienizado (remoção de “Forwarded message”, cabeçalhos repetidos, links/assinaturas).
+- O modelo Gemini recebe metadados (timestamp, destinatário, assunto, remetente) e o corpo limpo.
+- A LLM enquadra as informações exatamente nos 15 campos da aba quotes, retornando um JSON por e-mail.
+- O script salva um JSON por linha em outputs/quotes_extracted.jsonl.
+- Observações:
+- Quando alguma informação não existe no e-mail, é gravada como "" (string vazia).
+- O script reforça timestamp/destinatário/assunto a partir dos metadados caso a LLM deixe em branco.
+
+8. Fase 2 — Persistência na Planilha (aba quotes)
+-------------------------------------------------
+Execução:
+`$ python3 save_quotes_to_csv.py`
+
+O que acontece:
+
+- Lê outputs/quotes_extracted.jsonl.
+- Confere o cabeçalho atual da aba quotes (somente avisa se estiver diferente).
+- Converte cada objeto JSON em uma linha na ordem do cabeçalho e faz append na aba quotes.
+- Possíveis avisos/erros:
+- Cabeçalho diferente: o script apenas alerta e continua o append.
+- 403/permiso: compartilhe a planilha com o e-mail da service account.
+- SHEET_ID vazio: defina no .env.

@@ -16,3 +16,7 @@ token_files/
 
 # Segredos
 credentials/
+
+examples/
+
+outputs/
