@@ -5,7 +5,7 @@ from dateutil import tz
 
 from googleapiclient.discovery import Resource
 
-from utils.mime import get_header, extract_prefer_plaintext
+from modules.mime import get_header, extract_prefer_plaintext
 
 TZ_SAO_PAULO = tz.gettz("America/Sao_Paulo")
 

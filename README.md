@@ -44,7 +44,7 @@ Este repositório implementa um MVP simples e modular para:
 │   │
 │   ├── gmail_query.py
 │   │  → Funções para conversar com a Gmail API em alto nível:
-│   │     - `find_label_id(...)`: resolve o ID de um rótulo pelo nome (ex.: "COMPLETE_DATA").
+│   │     - `find_label_id(...)`: resolve o ID de um rótulo pelo nome (ex.: "QUOTES").
 │   │     - `list_messages(...)`: lista mensagens respeitando rótulos, query e paginação.
 │   │     - `get_thread(...)`: busca o conteúdo completo de uma thread (todas as mensagens).
 │   │     - `simplify_message(...)`: reduz cada mensagem para um dicionário padrão:
@@ -81,7 +81,7 @@ Este repositório implementa um MVP simples e modular para:
 ├── dump_threads.py
 │  → Script principal de coleta:
 │    - Parâmetros:
-│      --label "NOME_DO_ROTULO"   (ex.: COMPLETE_DATA)  [opcional]
+│      --label "NOME_DO_ROTULO"   (ex.: QUOTES)  [opcional]
 │      --q     "consulta gmail"   (ex.: from:foo@bar.com has:attachment)  [opcional]
 │      --after YYYY/MM/DD         (ex.: 2025/08/01)  [opcional]
 │      --before YYYY/MM/DD        (ex.: 2025/08/13)  [opcional]
@@ -155,7 +155,7 @@ O que acontece:
   📬 Rótulos encontrados:
    - INBOX
    - SENT
-   - COMPLETE_DATA
+   - QUOTES
    - ...
 
 Se quiser forçar um novo login (ou trocar de conta), apague o arquivo:
@@ -165,17 +165,17 @@ e rode novamente o list_labels.py.
 3) Coleta: salvar 1 JSON por thread (dump)
 ------------------------------------------
 Exemplo por rótulo + janela de datas:
-$ python3 dump_threads.py --label COMPLETE_DATA --after 2025/08/01 --before 2025/08/13 --max 200
+$ python3 dump_threads.py --label QUOTES --after 2025/08/01 --before 2025/08/13 --max 200
 
 Exemplo por consulta livre (sem rótulo):
 $ python3 dump_threads.py --q "from:alguem@empresa.com subject:cotação" --max 100
 
 Exemplo combinando rótulo e consulta:
-$ python3 dump_threads.py --label COMPLETE_DATA --q "from:alguem@empresa.com" --max 200
+$ python3 dump_threads.py --label QUOTES --q "from:alguem@empresa.com" --max 200
 
 O que acontece:
 - O script monta a busca usando os parâmetros fornecidos:
-  • --label: restringe a mensagens com o rótulo informado (ex.: COMPLETE_DATA).
+  • --label: restringe a mensagens com o rótulo informado (ex.: QUOTES).
   • --q: passa a consulta conforme a sintaxe de busca do Gmail (ex.: from:, to:, subject:, has:attachment, etc.).
   • --after e --before: filtros de data no formato YYYY/MM/DD (padrão do Gmail).
     - Regra prática: after:D/ M/ A significa “mais recentes que essa data” (exclusivo).
