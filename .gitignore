@@ -13,6 +13,9 @@ env/
 # Saídas
 raw_messages/
 token_files/
+incomplete_data/
+email_drafts/
+important_emails/
 
 # Segredos
 credentials/

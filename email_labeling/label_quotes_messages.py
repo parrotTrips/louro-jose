@@ -1,14 +1,12 @@
-# email_labeling/label_quotes_messages.py
 """
-Rotular SOMENTE mensagens (não a conversa inteira) que parecem "cotação" com o rótulo QUOTES.
-[... docstring original mantida ...]
+Rotular THREADS inteiras que parecem "cotação" com o rótulo QUOTES.
+Se qualquer MENSAGEM da thread bater na heurística, aplicamos o rótulo na thread toda.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import json
 import argparse
 import unicodedata
 from typing import Dict, List, Tuple
@@ -177,15 +175,19 @@ def looks_like_quote(subject: str, body: str, threshold: int = HEURISTIC_THRESHO
     return score >= threshold
 
 # =========================
-# Aplicar rótulo por mensagem
+# Aplicar rótulo por THREAD
 # =========================
 
-def message_has_label(msg: Dict, label_id: str) -> bool:
-    return label_id in set(msg.get("labelIds", []))
+def thread_has_label(thread: Dict, label_id: str) -> bool:
+    """Considera a thread rotulada se QUALQUER mensagem já tiver esse label."""
+    for msg in thread.get("messages", []):
+        if label_id in set(msg.get("labelIds", [])):
+            return True
+    return False
 
-def add_label_to_message(service, msg_id: str, label_id: str) -> None:
-    service.users().messages().modify(
-        userId="me", id=msg_id, body={"addLabelIds": [label_id], "removeLabelIds": []}
+def add_label_to_thread(service, thread_id: str, label_id: str) -> None:
+    service.users().threads().modify(
+        userId="me", id=thread_id, body={"addLabelIds": [label_id], "removeLabelIds": []}
     ).execute()
 
 # =========================
@@ -193,19 +195,29 @@ def add_label_to_message(service, msg_id: str, label_id: str) -> None:
 # =========================
 
 def process_threads(service, q: str, label_id: str) -> Dict[str, int]:
-    stats = {"threads": 0, "messages": 0, "labeled": 0}
+    stats = {"threads": 0, "messages": 0, "threads_labeled": 0}
     for th_id in search_thread_ids(service, q):
         stats["threads"] += 1
         thread = service.users().threads().get(userId="me", id=th_id, format="full").execute()
+
+        # Pule threads já rotuladas para evitar retrabalho
+        if thread_has_label(thread, label_id):
+            continue
+
+        # Varra as mensagens; ao primeiro match, rotule a thread toda e vá para a próxima
+        labeled_this_thread = False
         for msg in thread.get("messages", []):
             stats["messages"] += 1
-            if message_has_label(msg, label_id):
-                continue
             subject = get_header(msg, "Subject")
             body_text = get_plain_text_from_message(msg)
             if looks_like_quote(subject, body_text):
-                add_label_to_message(service, msg["id"], label_id)
-                stats["labeled"] += 1
+                add_label_to_thread(service, th_id, label_id)
+                stats["threads_labeled"] += 1
+                labeled_this_thread = True
+                break
+
+        # (opcional) poderia logar algo aqui se quiser saber quais não bateram
+
     return stats
 
 # =========================
@@ -214,7 +226,7 @@ def process_threads(service, q: str, label_id: str) -> Dict[str, int]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Rotula apenas mensagens de cotação com o rótulo especificado (padrão: QUOTES)."
+        description="Rotula THREADS de cotação com o rótulo especificado (padrão: QUOTES)."
     )
     parser.add_argument("--q", type=str, default=DEFAULT_QUERY,
                         help=f"Consulta Gmail para filtrar threads (padrão: '{DEFAULT_QUERY}').")
@@ -223,7 +235,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        _ensure_dir(TOKEN_DIR)   # <-- corrigido (garante a pasta, não o arquivo)
+        _ensure_dir(TOKEN_DIR)
         service = create_login(
             credentials_path=CREDENTIALS_PATH,
             token_path=TOKEN_PATH,
@@ -233,10 +245,10 @@ def main():
         stats = process_threads(service, args.q, label_id)
 
         print("✅ Finalizado.")
-        print(f"• Threads analisados : {stats['threads']}")
+        print(f"• Threads analisadas : {stats['threads']}")
         print(f"• Mensagens analisadas: {stats['messages']}")
-        print(f"• Mensagens rotuladas : {stats['labeled']}")
-        print(f"→ Rótulo aplicado por MENSAGEM: {args.label}")
+        print(f"• Threads rotuladas  : {stats['threads_labeled']}")
+        print(f"→ Rótulo aplicado por THREAD: {args.label}")
 
     except HttpError as e:
         print(f"❌ Erro Gmail API: {e}")
