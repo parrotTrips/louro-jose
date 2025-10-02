@@ -7,8 +7,8 @@ import sys
 import os
 from dotenv import load_dotenv
 
-sys.path.append("..")            # permite importar 'modules'
-load_dotenv("../.env")           # carrega variáveis de ambiente da raiz
+sys.path.append("..")  
+load_dotenv("../.env")
 
 from modules.login_gmail import create_login
 from modules.gmail_query import (
@@ -16,7 +16,6 @@ from modules.gmail_query import (
     build_gmail_query, unique_thread_ids
 )
 
-# Caminhos relativos à pasta atual (email_extractor/)
 DEFAULT_CREDENTIALS = "../credentials/real-credentials-parrots-gmail.json"
 DEFAULT_TOKEN = "../token_files/token_gmail_v1.json"
 DEFAULT_OUTDIR = "raw_messages"
@@ -28,7 +27,6 @@ def _sanitize(s: str) -> str:
     return s[:120].strip("_")
 
 def _name_from_sender(sender: str) -> str:
-    # Extrai "Nome" e "email" se vier no formato "Nome <email>"
     m = re.match(r"(?:(.*?)\s*)?<([^>]+)>", sender)
     if m:
         name = _sanitize(m.group(1) or "Unknown")
@@ -37,7 +35,6 @@ def _name_from_sender(sender: str) -> str:
     return _sanitize(sender or "Unknown")
 
 def _prefix_from_first_email(email: dict) -> str:
-    # timestamp: YYYYMMDD_HHMM
     ts = email.get("timestamp", "")
     m = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})", ts)
     if not m:
@@ -76,7 +73,7 @@ def dump_threads(
         t = get_thread(service, tid)
         messages = t.get("messages", [])
         emails = [simplify_message(m) for m in messages]
-        emails.sort(key=lambda e: e.get("timestamp", ""))  # ordem cronológica
+        emails.sort(key=lambda e: e.get("timestamp", ""))
 
         data = {
             "thread_id": tid,
