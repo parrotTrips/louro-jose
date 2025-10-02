@@ -14,7 +14,8 @@ env/
 raw_messages/
 token_files/
 incomplete_data/
-email_drafts/
+complete_data/
+draft_emails/
 important_emails/
 
 # Segredos
