@@ -2,13 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-llm_extract_data.py
--------------------
-Lê arquivos de `raw_messages/`, extrai campos via LLM (OpenRouter) e salva:
-  - complete_data/: JSONs completos (todos os HEADER_FIELDS presentes e não vazios)
-  - incomplete_data/: JSONs incompletos (lista _missing_fields) OU erros de parsing/LLM
+llm_extract_data.py (versão multi-cotações)
+-------------------------------------------
+Lê arquivos de `raw_messages/`, consulta um LLM (OpenRouter) e extrai **uma ou mais cotações**
+por arquivo — uma para **cada combinação distinta de tipo/configuração de quarto e preço**.
 
-Também gera um agregado `extracted_data.jsonl` na raiz do projeto (conveniente para análises).
+Saídas:
+  - complete_data/: 1+ JSONs completos por arquivo de entrada (todos os HEADER_FIELDS preenchidos)
+  - incomplete_data/: 1+ JSONs incompletos (lista _missing_fields) OU erros de parsing/LLM
+  - extracted_data.jsonl: agregado com **uma linha por cotação**
 
 Uso:
   python3 llm_extract_data.py
@@ -16,7 +18,7 @@ Uso:
       --model openai/gpt-4o --max_files 500
 
 Requisitos:
-  - pip install python-dotenv openai==1.* (SDK compatível com OpenRouter)
+  - pip install python-dotenv openai==1.*
   - Definir OPENROUTER_API_KEY no ambiente ou .env
 """
 
@@ -28,7 +30,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Union
 
 from dotenv import load_dotenv
 
@@ -38,7 +40,7 @@ DEFAULT_COMPLETE_DIR = "complete_data"
 DEFAULT_INCOMPLETE_DIR = "incomplete_data"
 DEFAULT_JSONL_AGG = "extracted_data.jsonl"
 
-# === Campos a serem extraídos (na ordem fornecida por você) ===
+# === Campos a serem extraídos (por cotação) ===
 HEADER_FIELDS: List[str] = [
     "Timestamp",
     "Fornecedor",
@@ -57,39 +59,36 @@ HEADER_FIELDS: List[str] = [
     "Serviços incluso? Explicação: existem hotéis que consideram a tarifa de serviço já incluso e outros não.",
     "Política de pagamento",
     "Política de cancelamento",
-    # >>> Novos campos solicitados <<<
     "Email do fornecedor",
     "Email do remetente (top-level)",
 ]
 
 # === Prompt do LLM ===
 SYSTEM_PROMPT = (
-    "Você é um assistente que extrai dados estruturados de e-mails de cotações de hotéis. "
-    "Retorne **apenas** um JSON único, sem comentários ou texto extra."
+    "Você extrai **cotações de hotel** de e-mails.\n"
+    "Sempre responda com **apenas um JSON** válido.\n"
+    "Cada combinação distinta de tipo/configuração de quarto e preço deve virar **um objeto separado**.\n"
+    "Se algum campo não existir, use string vazia \"\" (exceto `Preço (num)`, que deve ser número ou \"\")."
 )
 
-USER_PROMPT_TEMPLATE = """Extraia os seguintes campos do conteúdo abaixo. Se um campo não existir, deixe como string vazia "".
-
-Campos exigidos (use exatamente esses nomes de chave):
-{fields_json}
-
-Conteúdo do e-mail/thread (texto/JSON bruto):
-----------------
-{email_text}
-----------------
-
-Regras:
-- Responda **apenas** com um objeto JSON único, sem markdown, sem explicações.
-- Mantenha os nomes das chaves exatamente como fornecidos.
-- “Preço (num)” deve ser número (pode usar ponto como separador decimal). Caso não haja, deixe "".
-- Datas podem permanecer no formato encontrado; não invente valores.
-- “Email do remetente (top-level)” é o e-mail que aparece no PRIMEIRO cabeçalho "From:" do topo do corpo.
-- “Email do fornecedor” é o e-mail do hotel/fornecedor (normalmente um domínio diferente de parrottrips.com). Se houver vários, priorize o principal vinculado às tarifas da hospedagem.
-"""
+USER_PROMPT_TEMPLATE = """Extraia as cotações do conteúdo abaixo.\n\n\
+Regras obrigatórias:\n\
+- Saída deve ser **um único JSON** no formato **lista de objetos** (array).\n\
+- **Uma cotação por combinação distinta** de tipo/configuração de quarto e preço.\n\
+- Use **exatamente** estes nomes de chaves em **cada objeto**:\n{fields_json}\n\
+- Datas podem manter o formato encontrado. Não invente valores.\n\
+- `Preço (num)` deve ser numérico (ponto decimal) quando houver; caso contrário, use \"\".\n\
+- `Email do remetente (top-level)` é o e-mail do **primeiro** cabeçalho \"From:\" no topo do corpo.\n\
+- `Email do fornecedor` é o e-mail do hotel/fornecedor (geralmente não `parrottrips.com`).\n\
+- **Responda apenas com o JSON array**, sem markdown e sem texto extra.\n\n\
+Conteúdo do e-mail/thread (texto/JSON bruto):\n----------------\n{email_text}\n----------------\n\n\
+Exemplo de **formato da resposta** (apenas formato, valores fictícios):\n[\n  {{\n    \"Timestamp\": \"2025-08-08T12:41:12-03:00\",\n    \"Fornecedor\": \"Hotel X <reservas@hotelx.com>\",\n    \"Assunto\": \"Parrot Trips | Cidade | Hotel X | Reveillon\",\n    \"Nome do hotel\": \"Hotel X\",\n    \"Cidade\": \"Cidade\",\n    \"Check-in\": \"21/11/2025\",\n    \"Check-out\": \"24/11/2025\",\n    \"Número de quartos\": \"10\",\n    \"Tipo de quarto\": \"Standard DBL\",\n    \"Tipo de quarto (normalizado)\": \"Duplo\",\n    \"Preço (num)\": 900.0,\n    \"Qual configuração do quarto (twin, double)\": \"double\",\n    \"Tarifa NET ou comissionada?\": \"NET\",\n    \"Taxa? Ex.: 5% de ISS\": \"5% ISS\",\n    \"Serviços incluso? Explicação: existem hotéis que consideram a tarifa de serviço já incluso e outros não.\": \"café incluído\",\n    \"Política de pagamento\": \"50% antecipado\",\n    \"Política de cancelamento\": \"até 7 dias\",\n    \"Email do fornecedor\": \"reservas@hotelx.com\",\n    \"Email do remetente (top-level)\": \"becker@parrottrips.com\"\n  }},\n  {{ /* outra configuração/preço */ }}\n]\n"""
 
 # === Utilidades ===
+
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
 
 def _load_if_json(txt: str) -> Optional[dict]:
     try:
@@ -97,12 +96,9 @@ def _load_if_json(txt: str) -> Optional[dict]:
     except Exception:
         return None
 
+
 def read_text_any(path: Path) -> str:
-    """
-    Lê o conteúdo do arquivo como texto. Tenta:
-    - Se for JSON, retorna pretty string do próprio JSON (útil para LLM)
-    - Caso contrário, lê como texto bruto
-    """
+    """Lê como texto, mas se for JSON retorna uma versão pretty (melhor para o LLM)."""
     try:
         txt = path.read_text(encoding="utf-8", errors="ignore")
         obj = _load_if_json(txt)
@@ -112,56 +108,39 @@ def read_text_any(path: Path) -> str:
     except Exception as e:
         return f"<<ERRO AO LER ARQUIVO: {e}>>"
 
+
 def extract_body_from_rawtext(raw_text: str) -> str:
-    """
-    Tenta localizar um campo 'body' dentro de um JSON embutido no raw_text (se houver).
-    Caso contrário, retorna o raw_text original.
-    """
     obj = _load_if_json(raw_text)
     if isinstance(obj, dict):
-        # Tenta caminhos comuns para body
-        # Ex.: { "metadata": { "body": "..." } } ou { "body": "..." }
-        if "body" in obj and isinstance(obj["body"], str):
+        if isinstance(obj.get("body"), str):
             return obj["body"]
         md = obj.get("metadata")
         if isinstance(md, dict) and isinstance(md.get("body"), str):
             return md["body"]
     return raw_text
 
+
 EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.UNICODE)
 
+
 def extract_top_from_email(body_text: str) -> str:
-    """
-    Pega o primeiro e-mail que apareça numa linha iniciada por 'From:' no topo do corpo.
-    Ex.: 'From: Nome <email@dominio.com>'
-    """
-    # Considera apenas o início do corpo (primeiros ~3 blocos 'Forwarded message' inclusive)
     head = body_text[:3000]
-    # Procura linhas com 'From:'
     for line in head.splitlines():
         if line.strip().lower().startswith("from:"):
             m = EMAIL_REGEX.search(line)
             if m:
                 return m.group(0).strip()
-    # fallback: primeiro e-mail do texto
     m = EMAIL_REGEX.search(head)
     return m.group(0).strip() if m else ""
 
+
 def extract_supplier_email_heuristic(body_text: str) -> str:
-    """
-    Heurística simples para e-mail do fornecedor:
-      - Procura por e-mails cujo domínio NÃO seja 'parrottrips.com'
-      - Ignora domínios de redes sociais comuns.
-      - Prioriza os que aparecem em linhas com 'From:' ou 'To:'.
-    """
     ignore_domains = {
         "parrottrips.com", "facebook.com", "instagram.com", "linkedin.com",
-        "gmail.com", "googlemail.com"
+        "gmail.com", "googlemail.com",
     }
-
     candidates_priority: List[str] = []
     candidates_regular: List[str] = []
-
     for line in body_text.splitlines():
         emails = EMAIL_REGEX.findall(line)
         if not emails:
@@ -174,18 +153,14 @@ def extract_supplier_email_heuristic(body_text: str) -> str:
                 candidates_priority.append(em)
             else:
                 candidates_regular.append(em)
-
     if candidates_priority:
         return candidates_priority[0]
     if candidates_regular:
         return candidates_regular[0]
     return ""
 
+
 def coerce_price(value: Any) -> Any:
-    """
-    Converte “Preço (num)” para float se possível,
-    mantendo string vazia se não for viável.
-    """
     if value is None:
         return ""
     if isinstance(value, (int, float)):
@@ -193,7 +168,6 @@ def coerce_price(value: Any) -> Any:
     s = str(value).strip()
     if not s:
         return ""
-    # normalização simples de vírgula/ponto
     if s.count(",") == 1 and s.count(".") > 1:
         s = s.replace(".", "").replace(",", ".")
     else:
@@ -203,15 +177,19 @@ def coerce_price(value: Any) -> Any:
     except Exception:
         return ""
 
+
 def sanitize_json_only(s: str) -> str:
-    """
-    O modelo pode retornar texto extra. Pegamos o primeiro '{' e o último '}'.
-    """
-    start = s.find("{")
-    end = s.rfind("}")
+    start = s.find("[")
+    end = s.rfind("]")
     if start == -1 or end == -1 or end < start:
+        # fallback: tenta objeto simples (alguns modelos enviam objeto único)
+        start_obj = s.find("{")
+        end_obj = s.rfind("}")
+        if start_obj != -1 and end_obj != -1 and end_obj >= start_obj:
+            return s[start_obj : end_obj + 1]
         return s
     return s[start : end + 1]
+
 
 def complete_check(record: Dict[str, Any], required_fields: List[str]) -> Tuple[bool, List[str]]:
     missing = []
@@ -226,10 +204,13 @@ def complete_check(record: Dict[str, Any], required_fields: List[str]) -> Tuple[
                 missing.append(k)
     return (len(missing) == 0, missing)
 
+
 def load_env() -> None:
     load_dotenv()
 
+
 # === OpenRouter (SDK OpenAI) ===
+
 def make_client():
     from openai import OpenAI
     base_url = "https://openrouter.ai/api/v1"
@@ -239,11 +220,8 @@ def make_client():
     client = OpenAI(base_url=base_url, api_key=api_key)
     return client
 
+
 def call_llm(client, model: str, http_referer: str | None, x_title: str | None, email_text: str) -> str:
-    """
-    Chama o LLM com retries exponenciais.
-    Retorna o conteúdo bruto (string) da resposta do modelo.
-    """
     extra_headers = {}
     if http_referer:
         extra_headers["HTTP-Referer"] = http_referer
@@ -252,11 +230,11 @@ def call_llm(client, model: str, http_referer: str | None, x_title: str | None, 
 
     user_prompt = USER_PROMPT_TEMPLATE.format(
         fields_json=json.dumps(HEADER_FIELDS, ensure_ascii=False, indent=2),
-        email_text=email_text[:100000]  # proteção para inputs gigantes
+        email_text=email_text[:100000],
     )
 
     max_retries = 6
-    base_delay = 2.0  # segundos
+    base_delay = 2.0
     for attempt in range(1, max_retries + 1):
         try:
             completion = client.chat.completions.create(
@@ -277,12 +255,55 @@ def call_llm(client, model: str, http_referer: str | None, x_title: str | None, 
                 continue
             raise
 
-def parse_llm_json(text: str) -> Dict[str, Any]:
-    text = sanitize_json_only(text).strip()
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL)
-    return json.loads(text)
 
-# === Pipeline ===
+def parse_llm_to_list(text: str) -> List[Dict[str, Any]]:
+    """Converte a resposta do LLM para **lista de objetos**.
+    Aceita: array JSON direto; objeto único; objeto com chave \"Cotações\".
+    """
+    cleaned = sanitize_json_only(text).strip()
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+
+    try:
+        obj: Union[List[Any], Dict[str, Any]] = json.loads(cleaned)
+    except Exception as e:
+        raise ValueError(f"JSON parse fail: {e}")
+
+    if isinstance(obj, list):
+        # filtra apenas dicts
+        return [x for x in obj if isinstance(x, dict)]
+
+    if isinstance(obj, dict):
+        if isinstance(obj.get("Cotações"), list):
+            return [x for x in obj["Cotações"] if isinstance(x, dict)]
+        # objeto único — embrulha em lista
+        return [obj]
+
+    return []
+
+
+# === Pipeline por arquivo ===
+
+def enrich_and_validate_quote(quote: Dict[str, Any], body_text: str) -> Dict[str, Any]:
+    # Garante chaves e normaliza preço
+    for field in HEADER_FIELDS:
+        if field not in quote:
+            quote[field] = ""
+    quote["Preço (num)"] = coerce_price(quote.get("Preço (num)"))
+
+    # Heurísticas para e-mails
+    if not str(quote.get("Email do remetente (top-level)", "")).strip():
+        top_from = extract_top_from_email(body_text)
+        if top_from:
+            quote["Email do remetente (top-level)"] = top_from
+
+    if not str(quote.get("Email do fornecedor", "")).strip():
+        supplier = extract_supplier_email_heuristic(body_text)
+        if supplier:
+            quote["Email do fornecedor"] = supplier
+
+    return quote
+
+
 def process_file(
     client,
     model: str,
@@ -291,69 +312,65 @@ def process_file(
     path: Path,
     out_complete: Path,
     out_incomplete: Path,
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:
     raw_text_pretty = read_text_any(path)
     body_text = extract_body_from_rawtext(raw_text_pretty)
 
+    # === Chamada ao LLM ===
     llm_text = call_llm(client, model, http_referer, x_title, raw_text_pretty)
-    result: Dict[str, Any]
-    meta: Dict[str, Any] = {
+
+    meta_base: Dict[str, Any] = {
         "_source_raw": str(path),
         "_llm_model": model,
     }
 
+    # === Parsing p/ lista de cotações ===
     try:
-        result = parse_llm_json(llm_text)
+        quotes = parse_llm_to_list(llm_text)
     except Exception as e:
-        payload = {
-            **meta,
+        payload = [{
+            **meta_base,
             "_error": f"JSON parse fail: {e}",
             "_llm_raw_response": llm_text[:2000],
-        }
+        }]
         out_path = out_incomplete / (path.stem + "__parsed_error.json")
-        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        out_path.write_text(json.dumps(payload[0], ensure_ascii=False, indent=2), encoding="utf-8")
         return payload
 
-    # Garante todas as chaves no objeto final
-    for field in HEADER_FIELDS:
-        if field not in result:
-            result[field] = ""
+    # Se o modelo não retornou nada útil, registre um vazio
+    if not quotes:
+        err = {**meta_base, "_error": "EMPTY_RESULT_FROM_LLM"}
+        (out_incomplete / (path.stem + "__empty_result.json")).write_text(
+            json.dumps(err, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return [err]
 
-    # Coerção de preço
-    result["Preço (num)"] = coerce_price(result.get("Preço (num)"))
+    results: List[Dict[str, Any]] = []
 
-    # ===== Fallbacks / heurísticas específicas para os novos campos =====
-    # 1) Email do remetente (top-level)
-    if not result.get("Email do remetente (top-level)", "").strip():
-        top_from = extract_top_from_email(body_text)
-        if top_from:
-            result["Email do remetente (top-level)"] = top_from
+    # === Enriquecimento, validação e gravação 1:1 por cotação ===
+    for idx, q in enumerate(quotes, start=1):
+        q = enrich_and_validate_quote(q, body_text)
+        is_complete, missing = complete_check(q, HEADER_FIELDS)
+        out_obj = {**meta_base, **q}
+        if not is_complete:
+            out_obj["_missing_fields"] = missing
 
-    # 2) Email do fornecedor
-    if not result.get("Email do fornecedor", "").strip():
-        supplier = extract_supplier_email_heuristic(body_text)
-        if supplier:
-            result["Email do fornecedor"] = supplier
+        # Decide pasta e nomeia com índice
+        if is_complete:
+            out_path = out_complete / f"{path.stem}__extracted_{idx:02d}.json"
+        else:
+            out_path = out_incomplete / f"{path.stem}__extracted_incomplete_{idx:02d}.json"
 
-    # Avalia completude
-    is_complete, missing = complete_check(result, HEADER_FIELDS)
-    out_obj = {**meta, **result}
-    if not is_complete:
-        out_obj["_missing_fields"] = missing
+        out_path.write_text(json.dumps(out_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        results.append(out_obj)
 
-    # Decide pasta
-    if is_complete:
-        out_path = out_complete / (path.stem + "__extracted.json")
-    else:
-        out_path = out_incomplete / (path.stem + "__extracted_incomplete.json")
+    return results
 
-    out_path.write_text(json.dumps(out_obj, ensure_ascii=False, indent=2), encoding="utf-8")
-    return out_obj
 
 def main():
     load_env()
 
-    parser = argparse.ArgumentParser(description="Extrai dados de threads em raw_messages via OpenRouter LLM.")
+    parser = argparse.ArgumentParser(description="Extrai **múltiplas** cotações por arquivo via OpenRouter LLM.")
     parser.add_argument("--raw_dir", default=DEFAULT_RAW_DIR, help="Diretório com arquivos brutos (dump_threads).")
     parser.add_argument("--out_complete", default=DEFAULT_COMPLETE_DIR, help="Diretório para JSONs completos.")
     parser.add_argument("--out_incomplete", default=DEFAULT_INCOMPLETE_DIR, help="Diretório para JSONs incompletos/erros.")
@@ -386,14 +403,15 @@ def main():
         print("⚠️  Nenhum arquivo encontrado em raw_messages/.")
         sys.exit(0)
 
-    print(f"🧠 Extração via LLM em {len(files)} arquivo(s) de {raw_dir}/")
-    aggregated = []
-    ok, bad = 0, 0
+    print(f"🧠 Extração via LLM em {len(files)} arquivo(s) de {raw_dir}/ — múltiplas cotações por arquivo habilitadas")
+
+    aggregated: List[Dict[str, Any]] = []
+    ok_quotes, bad_quotes = 0, 0
 
     for i, f in enumerate(files, 1):
         print(f"[{i}/{len(files)}] → {f.name}")
         try:
-            out_obj = process_file(
+            out_list = process_file(
                 client=client,
                 model=args.model,
                 http_referer=args.http_referer or None,
@@ -402,11 +420,13 @@ def main():
                 out_complete=out_complete,
                 out_incomplete=out_incomplete,
             )
-            aggregated.append(out_obj)
-            if "_missing_fields" in out_obj or "_error" in out_obj:
-                bad += 1
-            else:
-                ok += 1
+            # agrega **cada** cotação separadamente
+            for row in out_list:
+                aggregated.append(row)
+                if ("_missing_fields" in row) or ("_error" in row):
+                    bad_quotes += 1
+                else:
+                    ok_quotes += 1
         except Exception as e:
             err_obj = {
                 "_source_raw": str(f),
@@ -418,8 +438,9 @@ def main():
                 encoding="utf-8",
             )
             aggregated.append(err_obj)
-            bad += 1
+            bad_quotes += 1
 
+    # Salva agregado (uma linha por cotação)
     try:
         with jsonl_out.open("w", encoding="utf-8") as fp:
             for row in aggregated:
@@ -428,7 +449,7 @@ def main():
     except Exception as e:
         print(f"⚠️  Falha ao salvar JSONL agregado ({jsonl_out}): {e}")
 
-    print(f"\n✅ Completos: {ok} | ⚠️ Incompletos/erros: {bad} | Total: {len(files)}")
+    print(f"\n✅ Cotações completas: {ok_quotes} | ⚠️ Cotações incompletas/erros: {bad_quotes} | Total de cotações: {ok_quotes + bad_quotes}")
 
 
 if __name__ == "__main__":
