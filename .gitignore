@@ -26,3 +26,7 @@ examples/
 outputs/
 
 example_data/
+
+qdrant_data/
+
+data/
