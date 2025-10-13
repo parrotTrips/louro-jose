@@ -26,3 +26,5 @@ examples/
 outputs/
 
 example_data/
+
+email_extractor/extracted_data.jsonl

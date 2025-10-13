@@ -2,10 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-llm_extract_data.py (versão multi-cotações)
--------------------------------------------
+llm_extract_data.py (versão multi-cotações) — CAMPOS ATUALIZADOS
+-----------------------------------------------------------------
+- Troca/Padronização de campos:
+    "Tipo de quarto (normalizado)"                -> "Categoria do quarto"
+    "Qual configuração do quarto (twin, double)"  -> "Configuração do quarto"
+    "Descrição de Valores" / "Descrição de Quartos" / "Descrição do Quarto"
+                                                   -> "Descrição dos Quartos"
+      (foco em tipos/configurações/capacidades/observações — não em preços)
+
 Lê arquivos de `raw_messages/`, consulta um LLM (OpenRouter) e extrai **uma ou mais cotações**
-por arquivo — uma para **cada combinação distinta de tipo/configuração de quarto e preço**.
+por arquivo — uma para **cada combinação distinta de categoria/configuração de quarto e preço**.
 
 Saídas:
   - complete_data/: 1+ JSONs completos por arquivo de entrada (todos os HEADER_FIELDS preenchidos)
@@ -40,7 +47,7 @@ DEFAULT_COMPLETE_DIR = "complete_data"
 DEFAULT_INCOMPLETE_DIR = "incomplete_data"
 DEFAULT_JSONL_AGG = "extracted_data.jsonl"
 
-# === Campos a serem extraídos (por cotação) ===
+# === Campos a serem extraídos (por cotação) — ATUALIZADOS ===
 HEADER_FIELDS: List[str] = [
     "Timestamp",
     "Fornecedor",
@@ -50,10 +57,10 @@ HEADER_FIELDS: List[str] = [
     "Check-in",
     "Check-out",
     "Número de quartos",
-    "Tipo de quarto",
-    "Tipo de quarto (normalizado)",
+    "Descrição dos Quartos",                      # texto consolidado sobre os quartos (categorias, camas, capacidades, observações) — sem preços
+    "Categoria do quarto",
     "Preço (num)",
-    "Qual configuração do quarto (twin, double)",
+    "Configuração do quarto",
     "Tarifa NET ou comissionada?",
     "Taxa? Ex.: 5% de ISS",
     "Serviços incluso? Explicação: existem hotéis que consideram a tarifa de serviço já incluso e outros não.",
@@ -63,26 +70,79 @@ HEADER_FIELDS: List[str] = [
     "Email do remetente (top-level)",
 ]
 
-# === Prompt do LLM ===
+# === Prompt do LLM (ATUALIZADO) ===
 SYSTEM_PROMPT = (
     "Você extrai **cotações de hotel** de e-mails.\n"
     "Sempre responda com **apenas um JSON** válido.\n"
-    "Cada combinação distinta de tipo/configuração de quarto e preço deve virar **um objeto separado**.\n"
-    "Se algum campo não existir, use string vazia \"\" (exceto `Preço (num)`, que deve ser número ou \"\")."
+    "Cada combinação distinta de **categoria/configuração de quarto e preço** deve virar **um objeto separado**.\n"
+    "Se algum campo não existir, use string vazia \"\" (exceto `Preço (num)`, que deve ser número ou \"\").\n"
+    "\n"
+    "Definições:\n"
+    "- **Categoria do quarto**: a classe comercial do quarto (p.ex.: standard, luxo, superior, deluxe, premium, master).\n"
+    "- **Configuração do quarto**: arranjo de leitos/ocupação (p.ex.: twin/duas de solteiro, double/uma de casal, "
+    "  1 casal + 1 solteiro, 3 solteiros, triplo, quádruplo, king, queen). Capture números e tipos de camas quando houver.\n"
+    "\n"
+    "Campo **Descrição dos Quartos** (obrigatório):\n"
+    "- Preencha **sempre** com um **resumo textual** sobre os quartos, consolidando:\n"
+    "  categorias/tipos, configurações de camas (quantidade e tipo), capacidades (single/duplo/triplo/quádruplo),\n"
+    "  e observações úteis (metragem, vista, facilidades do quarto, possibilidade de cama extra/berço etc.).\n"
+    "- Se o e-mail não trouxer um bloco explícito, **ainda assim** preencha com as informações deduzíveis\n"
+    "  a partir de outros campos extraídos (p.ex.: categoria/configuração/capacidade mencionadas em qualquer parte do texto).\n"
+    "- **Não inclua preços**. Se a descrição vier misturada com preços, remova símbolos e números de preço.\n"
+    "- Você pode organizar em bullets ou frases curtas; preserve quebras de linha quando útil.\n"
 )
 
-USER_PROMPT_TEMPLATE = """Extraia as cotações do conteúdo abaixo.\n\n\
-Regras obrigatórias:\n\
-- Saída deve ser **um único JSON** no formato **lista de objetos** (array).\n\
-- **Uma cotação por combinação distinta** de tipo/configuração de quarto e preço.\n\
-- Use **exatamente** estes nomes de chaves em **cada objeto**:\n{fields_json}\n\
-- Datas podem manter o formato encontrado. Não invente valores.\n\
-- `Preço (num)` deve ser numérico (ponto decimal) quando houver; caso contrário, use \"\".\n\
-- `Email do remetente (top-level)` é o e-mail do **primeiro** cabeçalho \"From:\" no topo do corpo.\n\
-- `Email do fornecedor` é o e-mail do hotel/fornecedor (geralmente não `parrottrips.com`).\n\
-- **Responda apenas com o JSON array**, sem markdown e sem texto extra.\n\n\
-Conteúdo do e-mail/thread (texto/JSON bruto):\n----------------\n{email_text}\n----------------\n\n\
-Exemplo de **formato da resposta** (apenas formato, valores fictícios):\n[\n  {{\n    \"Timestamp\": \"2025-08-08T12:41:12-03:00\",\n    \"Fornecedor\": \"Hotel X <reservas@hotelx.com>\",\n    \"Assunto\": \"Parrot Trips | Cidade | Hotel X | Reveillon\",\n    \"Nome do hotel\": \"Hotel X\",\n    \"Cidade\": \"Cidade\",\n    \"Check-in\": \"21/11/2025\",\n    \"Check-out\": \"24/11/2025\",\n    \"Número de quartos\": \"10\",\n    \"Tipo de quarto\": \"Standard DBL\",\n    \"Tipo de quarto (normalizado)\": \"Duplo\",\n    \"Preço (num)\": 900.0,\n    \"Qual configuração do quarto (twin, double)\": \"double\",\n    \"Tarifa NET ou comissionada?\": \"NET\",\n    \"Taxa? Ex.: 5% de ISS\": \"5% ISS\",\n    \"Serviços incluso? Explicação: existem hotéis que consideram a tarifa de serviço já incluso e outros não.\": \"café incluído\",\n    \"Política de pagamento\": \"50% antecipado\",\n    \"Política de cancelamento\": \"até 7 dias\",\n    \"Email do fornecedor\": \"reservas@hotelx.com\",\n    \"Email do remetente (top-level)\": \"becker@parrottrips.com\"\n  }},\n  {{ /* outra configuração/preço */ }}\n]\n"""
+USER_PROMPT_TEMPLATE = """Extraia as cotações do conteúdo abaixo.
+
+Regras obrigatórias:
+- Saída deve ser **um único JSON** no formato **lista de objetos** (array).
+- **Uma cotação por combinação distinta** de **categoria/configuração de quarto e preço**.
+- Use **exatamente** estes nomes de chaves em **cada objeto**:
+{fields_json}
+- Datas podem manter o formato encontrado. Não invente valores.
+- `Preço (num)` deve ser numérico (ponto decimal) quando houver; caso contrário, use "".
+- `Email do remetente (top-level)` é o e-mail do **primeiro** cabeçalho "From:" no topo do corpo.
+- `Email do fornecedor` é o e-mail do hotel/fornecedor (geralmente não `parrottrips.com`).
+- **Responda apenas com o JSON array**, sem markdown e sem texto extra.
+
+Instruções específicas para **Descrição dos Quartos** (preencha sempre):
+- Se houver um bloco descritivo de acomodações (p.ex.: “Acomodações disponíveis”, “Apartamentos”, “Tipos de quarto”, “Categorias”):
+  copie-o **sem preços**, mantendo bullets/quebras, e complemente com capacidades/configurações se estiverem em outro trecho.
+- Se não houver bloco explícito, **construa** um resumo a partir de qualquer menção a:
+  categoria (standard/luxo/superior/deluxe...), configuração de camas (1 king; 2 twin; 1 casal + 1 solteiro), capacidade
+  (single/duplo/triplo/quádruplo), observações (metragem, vista, facilidades, berço/cama extra).
+- Remova preços e símbolos monetários de qualquer linha da descrição.
+
+Exemplo de **formato da resposta** (apenas formato, valores fictícios):
+[
+  {{
+    "Timestamp": "2025-08-08T12:41:12-03:00",
+    "Fornecedor": "Hotel X <reservas@hotelx.com>",
+    "Assunto": "Parrot Trips | Cidade | Hotel X | Reveillon",
+    "Nome do hotel": "Hotel X",
+    "Cidade": "Cidade",
+    "Check-in": "21/11/2025",
+    "Check-out": "24/11/2025",
+    "Número de quartos": "10",
+    "Descrição dos Quartos": "• Duplo Luxo: 1 king ou 2 twin; ~32 m²; vista parcial mar.\\n• Duplo Standard: 1 casal; ~25 m²; vista cidade.\\nCapacidades: single/duplo; alguns aceitam 1 cama extra (triplo). Observações: berço sob consulta; andares com varanda.",
+    "Categoria do quarto": "Luxo",
+    "Preço (num)": 900.0,
+    "Configuração do quarto": "double (1 cama de casal)",
+    "Tarifa NET ou comissionada?": "NET",
+    "Taxa? Ex.: 5% de ISS": "5% ISS",
+    "Serviços incluso? Explicação: existem hotéis que consideram a tarifa de serviço já incluso e outros não.": "café incluído",
+    "Política de pagamento": "50% antecipado",
+    "Política de cancelamento": "até 7 dias",
+    "Email do fornecedor": "reservas@hotelx.com",
+    "Email do remetente (top-level)": "becker@parrottrips.com"
+  }}
+]
+
+Conteúdo do e-mail/thread (texto/JSON bruto):
+----------------
+{email_text}
+----------------
+"""
 
 # === Utilidades ===
 
@@ -168,6 +228,7 @@ def coerce_price(value: Any) -> Any:
     s = str(value).strip()
     if not s:
         return ""
+    # BR: "1.234,56" | US: "1,234.56" | simples: "1234,56" or "1234.56"
     if s.count(",") == 1 and s.count(".") > 1:
         s = s.replace(".", "").replace(",", ".")
     else:
@@ -182,7 +243,7 @@ def sanitize_json_only(s: str) -> str:
     start = s.find("[")
     end = s.rfind("]")
     if start == -1 or end == -1 or end < start:
-        # fallback: tenta objeto simples (alguns modelos enviam objeto único)
+        # fallback: tenta objeto simples
         start_obj = s.find("{")
         end_obj = s.rfind("}")
         if start_obj != -1 and end_obj != -1 and end_obj >= start_obj:
@@ -269,25 +330,86 @@ def parse_llm_to_list(text: str) -> List[Dict[str, Any]]:
         raise ValueError(f"JSON parse fail: {e}")
 
     if isinstance(obj, list):
-        # filtra apenas dicts
         return [x for x in obj if isinstance(x, dict)]
 
     if isinstance(obj, dict):
         if isinstance(obj.get("Cotações"), list):
             return [x for x in obj["Cotações"] if isinstance(x, dict)]
-        # objeto único — embrulha em lista
         return [obj]
 
     return []
 
 
+# === Compatibilidade retroativa de chaves antigas -> novas ===
+
+OLD_TO_NEW_KEYS = {
+    "Tipo de quarto (normalizado)": "Categoria do quarto",
+    "Qual configuração do quarto (twin, double)": "Configuração do quarto",
+    "Descrição de Valores": "Descrição dos Quartos",
+    "Descrição de Quartos": "Descrição dos Quartos",
+    "Descrição do Quarto": "Descrição dos Quartos",
+}
+
+def normalize_key_aliases(d: Dict[str, Any]) -> Dict[str, Any]:
+    if not d:
+        return d
+    out = dict(d)
+    for old_k, new_k in OLD_TO_NEW_KEYS.items():
+        if old_k in out and new_k not in out:
+            out[new_k] = out.pop(old_k)
+    return out
+
+
+# === Helpers de pós-processamento ===
+
+_PRICE_TOKEN_RE = re.compile(
+    r"(R\$\s?\d[\d\.\,]*|\$\s?\d[\d\.\,]*|\b\d{1,3}(\.\d{3})*(,\d+)?\b)",
+    re.IGNORECASE,
+)
+
+def strip_price_tokens(text: str) -> str:
+    """Remove tokens de preço de descrições."""
+    if not isinstance(text, str) or not text.strip():
+        return text
+    # remove apenas quando há indício de preço (símbolos/formatos comuns)
+    cleaned = _PRICE_TOKEN_RE.sub("", text)
+    # normaliza espaços duplos resultantes
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    # normaliza quebras em linhas limpas
+    cleaned = "\n".join(line.rstrip() for line in cleaned.splitlines())
+    return cleaned.strip()
+
+
+def synthesize_room_description(quote: Dict[str, Any]) -> str:
+    """Se o LLM não preencheu 'Descrição dos Quartos', sintetiza uma mínima
+    usando campos já extraídos (categoria/configuração/nº de quartos)."""
+    cat = str(quote.get("Categoria do quarto", "") or "").strip()
+    cfg = str(quote.get("Configuração do quarto", "") or "").strip()
+    nquartos = str(quote.get("Número de quartos", "") or "").strip()
+
+    parts = []
+    if cat:
+        parts.append(f"Categoria: {cat}")
+    if cfg:
+        parts.append(f"Configuração de camas: {cfg}")
+    if nquartos:
+        parts.append(f"Número de quartos: {nquartos}")
+
+    desc = " | ".join(parts)
+    return desc if desc else ""
+
+
 # === Pipeline por arquivo ===
 
 def enrich_and_validate_quote(quote: Dict[str, Any], body_text: str) -> Dict[str, Any]:
+    # Normaliza possíveis chaves antigas para as novas
+    quote = normalize_key_aliases(quote)
+
     # Garante chaves e normaliza preço
     for field in HEADER_FIELDS:
         if field not in quote:
             quote[field] = ""
+
     quote["Preço (num)"] = coerce_price(quote.get("Preço (num)"))
 
     # Heurísticas para e-mails
@@ -300,6 +422,16 @@ def enrich_and_validate_quote(quote: Dict[str, Any], body_text: str) -> Dict[str
         supplier = extract_supplier_email_heuristic(body_text)
         if supplier:
             quote["Email do fornecedor"] = supplier
+
+    # Preenchimento/limpeza de "Descrição dos Quartos"
+    desc = strip_price_tokens(str(quote.get("Descrição dos Quartos", "") or ""))
+    if not desc:
+        desc = synthesize_room_description(quote)
+    else:
+        # mesmo se veio do LLM, limpa potenciais preços residuais
+        desc = strip_price_tokens(desc)
+
+    quote["Descrição dos Quartos"] = desc
 
     return quote
 
@@ -370,7 +502,7 @@ def process_file(
 def main():
     load_env()
 
-    parser = argparse.ArgumentParser(description="Extrai **múltiplas** cotações por arquivo via OpenRouter LLM.")
+    parser = argparse.ArgumentParser(description="Extrai **múltiplas** cotações por arquivo via OpenRouter LLM (campos atualizados).")
     parser.add_argument("--raw_dir", default=DEFAULT_RAW_DIR, help="Diretório com arquivos brutos (dump_threads).")
     parser.add_argument("--out_complete", default=DEFAULT_COMPLETE_DIR, help="Diretório para JSONs completos.")
     parser.add_argument("--out_incomplete", default=DEFAULT_INCOMPLETE_DIR, help="Diretório para JSONs incompletos/erros.")
@@ -403,7 +535,7 @@ def main():
         print("⚠️  Nenhum arquivo encontrado em raw_messages/.")
         sys.exit(0)
 
-    print(f"🧠 Extração via LLM em {len(files)} arquivo(s) de {raw_dir}/ — múltiplas cotações por arquivo habilitadas")
+    print(f"🧠 Extração via LLM em {len(files)} arquivo(s) de {raw_dir}/ — múltiplas cotações por arquivo habilitadas (campos novos)")
 
     aggregated: List[Dict[str, Any]] = []
     ok_quotes, bad_quotes = 0, 0
@@ -420,7 +552,6 @@ def main():
                 out_complete=out_complete,
                 out_incomplete=out_incomplete,
             )
-            # agrega **cada** cotação separadamente
             for row in out_list:
                 aggregated.append(row)
                 if ("_missing_fields" in row) or ("_error" in row):
