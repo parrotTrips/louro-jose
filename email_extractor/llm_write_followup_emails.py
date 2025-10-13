@@ -6,6 +6,8 @@ import glob
 import json
 import re
 import time
+import unicodedata
+from collections import defaultdict, Counter
 from typing import Dict, List, Tuple, Optional
 
 from dotenv import load_dotenv
@@ -27,6 +29,7 @@ DEFAULT_FROM_NAME = os.getenv("PARROT_FROM_NAME", "Equipe Parrot Trips").strip()
 DEFAULT_FROM_EMAIL = os.getenv("PARROT_FROM_EMAIL", "").strip()
 DEFAULT_CC = os.getenv("PARROT_DEFAULT_CC", "").strip()
 
+# -------------------- util: normalização/regex --------------------
 
 _EMAIL_RE = re.compile(
     r'(?:"?([^"]*)"?\s*)<([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})>|'
@@ -51,6 +54,18 @@ def _parse_name(s: str) -> str:
     m = re.search(r'^"?([^"<]+?)"?\s*<', s or "")
     return m.group(1).strip() if m else ""
 
+def _norm(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = unicodedata.normalize("NFD", s)
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+
+def _slug(s: str) -> str:
+    s = _norm(s)
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s or "sem-nome"
+
+# -------------------- mapeamento de perguntas --------------------
 
 QUESTION_TEMPLATES = {
     "Taxa": "Existe alguma taxa adicional? Exemplos: ISS (5%), taxa de serviço ou taxa de turismo. Se houver, poderia detalhar o percentual e se já está incluída no preço?",
@@ -193,7 +208,7 @@ def _call_llm_followup(prompt: str) -> Dict[str, str]:
     except Exception:
         return {"subject": "Informações pendentes da cotação", "body": text}
 
-# -------------------- helpers --------------------
+# -------------------- helpers: payload -> infos --------------------
 
 def _get_missing_fields(payload: Dict) -> List[str]:
     """
@@ -220,6 +235,9 @@ def _friendly_supplier_name(payload: Dict) -> str:
     # tenta from do meta
     pm = payload.get("_picked_email_meta") or {}
     name = _parse_name(pm.get("from", "")) or ""
+    # se ainda vazio, tenta Nome do hotel
+    if not name:
+        name = (payload.get("Nome do hotel") or "").strip()
     return name
 
 def _supplier_email(payload: Dict) -> Optional[str]:
@@ -256,6 +274,76 @@ def _original_subject(payload: Dict) -> str:
     pm = payload.get("_picked_email_meta") or {}
     return (pm.get("subject") or "").strip()
 
+def _group_key(payload: Dict) -> Tuple[str, str]:
+    """
+    Chave de agrupamento:
+      1) Preferir e-mail do fornecedor (domínio/pessoa específica)
+      2) Fallback: (Nome do hotel + Cidade)
+    """
+    email = _supplier_email(payload) or ""
+    if email:
+        return ("email", email.lower())
+    hotel = (payload.get("Nome do hotel") or "").strip()
+    city = (payload.get("Cidade") or "").strip()
+    if hotel or city:
+        return ("hotel_city", f"{_norm(hotel)}|{_norm(city)}")
+    # fallback final: assunto normalizado (raro)
+    subj = _original_subject(payload)
+    return ("subject", _norm(subj))
+
+def _pick_to_email(payloads: List[Dict]) -> Optional[str]:
+    emails = []
+    for p in payloads:
+        e = _supplier_email(p)
+        if e:
+            emails.append(e.lower())
+    if not emails:
+        return None
+    most_common = Counter(emails).most_common(1)[0][0]
+    return most_common
+
+def _pick_supplier_name(payloads: List[Dict]) -> str:
+    # tenta pelo nome do fornecedor/hotel mais frequente
+    names = []
+    for p in payloads:
+        n = _friendly_supplier_name(p)
+        if n:
+            names.append(n)
+    if names:
+        return Counter(names).most_common(1)[0][0]
+    # fallback: Nome do hotel
+    hotels = []
+    for p in payloads:
+        h = (p.get("Nome do hotel") or "").strip()
+        if h:
+            hotels.append(h)
+    if hotels:
+        return Counter(hotels).most_common(1)[0][0]
+    return "parceiro"
+
+def _pick_original_subject(payloads: List[Dict]) -> str:
+    # reusa um assunto representativo
+    subs = []
+    for p in payloads:
+        s = _original_subject(p)
+        if s:
+            subs.append(s)
+    if subs:
+        return subs[0]
+    return "Parrot Trips | Informações pendentes"
+
+def _collect_missing_fields(payloads: List[Dict]) -> List[str]:
+    seen = set()
+    fields: List[str] = []
+    for p in payloads:
+        for f in _get_missing_fields(p):
+            if f not in seen:
+                seen.add(f)
+                fields.append(f)
+    return fields
+
+# -------------------- salvar drafts --------------------
+
 def _save_draft(base_name: str,
                 to_email: Optional[str],
                 cc: str,
@@ -283,7 +371,7 @@ def _save_draft(base_name: str,
         f.write(body.strip() + "\n")
     return json_path, txt_path
 
-# -------------------- main --------------------
+# -------------------- main (agrupado por hotel/fornecedor) --------------------
 
 def main():
     if not OPENROUTER_API_KEY:
@@ -294,26 +382,34 @@ def main():
         print(f"⛔ Nenhum arquivo .json encontrado em {INCOMPLETE_DIR}/")
         return
 
-    print(f"✉️  Gerando e-mails de follow-up para {len(files)} arquivo(s) incompletos…")
-
-    created = 0
+    # 1) Carrega e agrupa os payloads por grupo (fornecedor/hotel)
+    groups: Dict[Tuple[str, str], List[Dict]] = defaultdict(list)
+    total_payloads = 0
     for path in files:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
+            total_payloads += 1
         except Exception as e:
             print(f"⚠️ Erro ao ler {os.path.basename(path)}: {e}")
             continue
+        key = _group_key(payload)
+        groups[key].append(payload)
 
-        missing_fields = _get_missing_fields(payload)
+    print(f"✉️  Gerando e-mails de follow-up para {len(groups)} grupo(s) (a partir de {total_payloads} arquivo(s) incompletos)…")
+
+    created = 0
+    for key, payloads in groups.items():
+        # 2) Consolida perguntas e metadados
+        missing_fields = _collect_missing_fields(payloads)
         if not missing_fields:
-            # nada a perguntar; pula
+            # nada a perguntar neste grupo
             continue
 
         questions = [question_for_field(f) for f in missing_fields]
-        supplier_name = _friendly_supplier_name(payload)
-        orig_subject = _original_subject(payload)
-        to_email = _supplier_email(payload)
+        supplier_name = _pick_supplier_name(payloads)
+        orig_subject = _pick_original_subject(payloads)
+        to_email = _pick_to_email(payloads)
 
         prompt_ctx = {
             "supplier_name": supplier_name,
@@ -323,27 +419,43 @@ def main():
         }
         reply = _call_llm_followup(build_followup_prompt(prompt_ctx))
 
-        subject = reply.get("subject") or "Informações pendentes da cotação"
-        body = reply.get("body") or (
-            f"Olá {supplier_name or 'time'},\n\n"
-            "Tudo bem? Obrigado pela cotação enviada. Durante a conferência, notamos que alguns pontos ficaram pendentes:\n"
-            + "".join(f"- {q}\n" for q in questions) +
-            "\nPoderiam, por favor, nos confirmar essas informações? Agradecemos desde já!\n\n"
-            f"{DEFAULT_FROM_NAME}\nParrot Trips"
-        )
+        # 3) Subject/body padrão se LLM falhar
+        subject_llm = reply.get("subject") or ""
+        body_llm = (reply.get("body") or "").strip()
 
-        base = os.path.splitext(os.path.basename(path))[0]
+        # Subject sugerido se vazio: mantem o contexto e indica consolidação
+        if not subject_llm:
+            base_subj = orig_subject or f"Parrot Trips | {supplier_name}"
+            subject_llm = f"{base_subj} — Informações pendentes (consolidado)"
+
+        if not body_llm:
+            body_llm = (
+                f"Olá {supplier_name or 'time'},\n\n"
+                "Tudo bem? Obrigado pelas cotações enviadas. Durante a conferência, notamos que alguns pontos ficaram pendentes:\n"
+                + "".join(f"- {q}\n" for q in questions) +
+                "\nPoderiam, por favor, nos confirmar essas informações? Agradecemos desde já!\n\n"
+                f"{DEFAULT_FROM_NAME}\nParrot Trips"
+            )
+
+        # 4) Nome de arquivo por grupo (evita duplicar por hotel/fornecedor)
+        if key[0] == "email":
+            base = f"group__by_email__{_slug(key[1])}"
+        elif key[0] == "hotel_city":
+            base = f"group__by_hotelcity__{_slug(key[1])}"
+        else:
+            base = f"group__by_subject__{_slug(key[1])}"
+
         jpath, tpath = _save_draft(
             base_name=base,
             to_email=to_email,
             cc=DEFAULT_CC,
-            subject=subject,
-            body=body,
+            subject=subject_llm,
+            body=body_llm,
         )
         created += 1
-        print(f"✅ Draft criado: {os.path.basename(jpath)} | {os.path.basename(tpath)}  → To: {to_email or '(vazio)'}")
+        print(f"✅ Draft criado (grupo): {os.path.basename(jpath)} | {os.path.basename(tpath)}  → To: {to_email or '(vazio)'}")
 
-    print(f"🏁 Pronto! {created} draft(s) gerado(s) em {DRAFTS_DIR}/")
+    print(f"🏁 Pronto! {created} draft(s) consolidado(s) em {DRAFTS_DIR}/")
 
 if __name__ == "__main__":
     main()

@@ -1,9 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-llm_extract_data.py (versão multi-cotações) — CAMPOS ATUALIZADOS
------------------------------------------------------------------
 - Troca/Padronização de campos:
     "Tipo de quarto (normalizado)"                -> "Categoria do quarto"
     "Qual configuração do quarto (twin, double)"  -> "Configuração do quarto"
@@ -36,6 +31,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Union
 
@@ -57,7 +53,7 @@ HEADER_FIELDS: List[str] = [
     "Check-in",
     "Check-out",
     "Número de quartos",
-    "Descrição dos Quartos",                      # texto consolidado sobre os quartos (categorias, camas, capacidades, observações) — sem preços
+    "Descrição dos Quartos",                      # texto específico da cotação (categoria/config/observações do quarto) — sem preços
     "Categoria do quarto",
     "Preço (num)",
     "Configuração do quarto",
@@ -82,14 +78,15 @@ SYSTEM_PROMPT = (
     "- **Configuração do quarto**: arranjo de leitos/ocupação (p.ex.: twin/duas de solteiro, double/uma de casal, "
     "  1 casal + 1 solteiro, 3 solteiros, triplo, quádruplo, king, queen). Capture números e tipos de camas quando houver.\n"
     "\n"
-    "Campo **Descrição dos Quartos** (obrigatório):\n"
-    "- Preencha **sempre** com um **resumo textual** sobre os quartos, consolidando:\n"
-    "  categorias/tipos, configurações de camas (quantidade e tipo), capacidades (single/duplo/triplo/quádruplo),\n"
-    "  e observações úteis (metragem, vista, facilidades do quarto, possibilidade de cama extra/berço etc.).\n"
-    "- Se o e-mail não trouxer um bloco explícito, **ainda assim** preencha com as informações deduzíveis\n"
-    "  a partir de outros campos extraídos (p.ex.: categoria/configuração/capacidade mencionadas em qualquer parte do texto).\n"
-    "- **Não inclua preços**. Se a descrição vier misturada com preços, remova símbolos e números de preço.\n"
-    "- Você pode organizar em bullets ou frases curtas; preserve quebras de linha quando útil.\n"
+    "Campo **Descrição dos Quartos** (obrigatório e **específico da cotação**):\n"
+    "- Deve conter **apenas a descrição referente à categoria/configuração daquela cotação** (uma linha/bullet curto),\n"
+    "  **não** copie o bloco inteiro que lista todas as categorias.\n"
+    "- Se houver um bloco com várias categorias, selecione **somente** o trecho da categoria correspondente;\n"
+    "  se houver sublinhas por configuração (SGL/DBL, twin/double, triplo), escolha a sublinha correta.\n"
+    "- Se não houver trecho específico, **sintetize** curto a partir dos campos (ex.: `Standard: SGL/DBL`).\n"
+    "- **Não inclua preços**. Remova símbolos e números de preço se vierem misturados.\n"
+    "- Inclua apenas observações **intrínsecas ao quarto** (vista, metragem, tipo/qtde de camas, capacidade, berço/cama extra);\n"
+    "  não repita itens gerais como café da manhã, taxas, política de pagamento/cancelamento.\n"
 )
 
 USER_PROMPT_TEMPLATE = """Extraia as cotações do conteúdo abaixo.
@@ -105,13 +102,10 @@ Regras obrigatórias:
 - `Email do fornecedor` é o e-mail do hotel/fornecedor (geralmente não `parrottrips.com`).
 - **Responda apenas com o JSON array**, sem markdown e sem texto extra.
 
-Instruções específicas para **Descrição dos Quartos** (preencha sempre):
-- Se houver um bloco descritivo de acomodações (p.ex.: “Acomodações disponíveis”, “Apartamentos”, “Tipos de quarto”, “Categorias”):
-  copie-o **sem preços**, mantendo bullets/quebras, e complemente com capacidades/configurações se estiverem em outro trecho.
-- Se não houver bloco explícito, **construa** um resumo a partir de qualquer menção a:
-  categoria (standard/luxo/superior/deluxe...), configuração de camas (1 king; 2 twin; 1 casal + 1 solteiro), capacidade
-  (single/duplo/triplo/quádruplo), observações (metragem, vista, facilidades, berço/cama extra).
-- Remova preços e símbolos monetários de qualquer linha da descrição.
+Instruções específicas para **Descrição dos Quartos** (**coluna I**, preencher sempre e de forma **específica**):
+- Quando houver bloco com múltiplas categorias, selecione **somente** a linha/trecho da **categoria** e, se aplicável, da **configuração** correspondentes àquela cotação.
+- Se não houver linha específica, **sintetize** curto a partir de categoria/configuração: ex. `Standard: SGL/DBL`.
+- **Não** inclua preços nem itens gerais (café da manhã, taxas, políticas).
 
 Exemplo de **formato da resposta** (apenas formato, valores fictícios):
 [
@@ -124,10 +118,10 @@ Exemplo de **formato da resposta** (apenas formato, valores fictícios):
     "Check-in": "21/11/2025",
     "Check-out": "24/11/2025",
     "Número de quartos": "10",
-    "Descrição dos Quartos": "• Duplo Luxo: 1 king ou 2 twin; ~32 m²; vista parcial mar.\\n• Duplo Standard: 1 casal; ~25 m²; vista cidade.\\nCapacidades: single/duplo; alguns aceitam 1 cama extra (triplo). Observações: berço sob consulta; andares com varanda.",
-    "Categoria do quarto": "Luxo",
+    "Descrição dos Quartos": "Standard: SGL/DBL; ~25 m²; vista cidade.",
+    "Categoria do quarto": "Standard",
     "Preço (num)": 900.0,
-    "Configuração do quarto": "double (1 cama de casal)",
+    "Configuração do quarto": "SGL/DBL",
     "Tarifa NET ou comissionada?": "NET",
     "Taxa? Ex.: 5% de ISS": "5% ISS",
     "Serviços incluso? Explicação: existem hotéis que consideram a tarifa de serviço já incluso e outros não.": "café incluído",
@@ -367,36 +361,209 @@ _PRICE_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 
+HOTEL_WIDE_TERMS = (
+    "café da manhã", "cafe da manha",
+    "taxa", "iss", "serviço", "servico",
+    "política de pagamento", "politica de pagamento",
+    "política de cancelamento", "politica de cancelamento",
+    "pré pagamento", "pre pagamento", "pré-pagamento", "pre-pagamento",
+    "no show", "faturamento", "boleto", "pix", "cartão", "cartao", "depósito", "deposito"
+)
+
 def strip_price_tokens(text: str) -> str:
     """Remove tokens de preço de descrições."""
     if not isinstance(text, str) or not text.strip():
         return text
-    # remove apenas quando há indício de preço (símbolos/formatos comuns)
     cleaned = _PRICE_TOKEN_RE.sub("", text)
-    # normaliza espaços duplos resultantes
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
-    # normaliza quebras em linhas limpas
     cleaned = "\n".join(line.rstrip() for line in cleaned.splitlines())
     return cleaned.strip()
 
 
+def _norm(s: str) -> str:
+    """Normaliza para comparação (lower, sem acento)."""
+    s = s or ""
+    s = s.lower().strip()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return s
+
+def _line_split_chunks(text: str) -> List[str]:
+    """Separa bloco em linhas/cartos curtos: por quebras de linha e bullets."""
+    if not text:
+        return []
+    # quebra em bullets '•' ou hífens ou quebras
+    parts = re.split(r"(?:\n|\r|\r\n|^)\s*[•\-–]\s*|[\r\n]+", text)
+    parts = [p.strip(" \t;,.") for p in parts if p and p.strip()]
+    # juntar linhas muito curtas que provavelmente foram quebradas no meio
+    joined: List[str] = []
+    buf = ""
+    for p in parts:
+        if not buf:
+            buf = p
+        else:
+            # Heurística: se terminou sem ponto e a próxima começa minúscula, pode ser continuação
+            if (not re.search(r"[.;:]$", buf)) and re.match(r"^[a-zà-ú0-9]", _norm(p)):
+                buf = f"{buf} {p}"
+            else:
+                joined.append(buf.strip())
+                buf = p
+    if buf:
+        joined.append(buf.strip())
+    return joined
+
+def _config_keywords(cfg: str) -> List[str]:
+    """Extrai palavras-chave de configuração e seus sinônimos comuns."""
+    n = _norm(cfg)
+    keys: set[str] = set()
+    if not n:
+        return []
+    # básicos
+    if "sgl" in n or "single" in n or "individual" in n:
+        keys.update(["sgl", "single", "individual", "single/individual"])
+    if "dbl" in n or "duplo" in n or "double" in n or "casal" in n:
+        keys.update(["dbl", "duplo", "double", "casal", "s/d"])  # s/d às vezes aparece como abreviação
+    if "twin" in n or "duas camas" in n or "2 twin" in n or "solteiro" in n:
+        keys.update(["twin", "2 twin", "duas camas", "solteiro", "2 solteiro", "duas de solteiro"])
+    if "trip" in n or "tripl" in n or "3" in n:
+        keys.update(["triplo", "triple", "3", "trp"])
+    if "quad" in n or "quadru" in n or "4" in n:
+        keys.update(["quadruplo", "quadruple", "4", "qdp"])
+    if "king" in n:
+        keys.update(["king"])
+    if "queen" in n:
+        keys.update(["queen"])
+    if "casal" in n:
+        keys.update(["casal"])
+    return sorted(keys)
+
+def _category_match_score(line: str, categoria: str) -> int:
+    nline = _norm(line)
+    ncat = _norm(categoria)
+    score = 0
+    # match direto do nome da categoria
+    if ncat and ncat in nline:
+        score += 2
+    # reforços por aliases comuns
+    aliases = {
+        "standard": ["std", "standard"],
+        "superior": ["superior"],
+        "luxo": ["luxo", "deluxe", "lux"],
+        "deluxe": ["deluxe", "luxo"],
+        "classic": ["classic"],
+        "master": ["master"],
+        "premium": ["premium"],
+    }
+    for k, vals in aliases.items():
+        if k in ncat:
+            if any(val in nline for val in vals):
+                score += 1
+    # pistas de que é cabeçalho de categoria
+    if re.match(r"^(categoria|apto\.?|apartamento|standard|superior|luxo|deluxe|classic)\b", nline):
+        score += 1
+    return score
+
+def _config_match_score(line: str, cfg: str) -> int:
+    nline = _norm(line)
+    keys = _config_keywords(cfg)
+    if not keys:
+        return 0
+    score = 0
+    for k in keys:
+        if k in nline:
+            score += 1
+    # padrões de ocupação
+    if any(w in nline for w in ["single", "individual"]):
+        score += 1 if any(w in _norm(cfg) for w in ["single", "individual", "sgl"]) else 0
+    if any(w in nline for w in ["duplo", "double", "casal"]):
+        score += 1 if any(w in _norm(cfg) for w in ["duplo", "double", "casal", "dbl"]) else 0
+    if "twin" in nline:
+        score += 1 if "twin" in _norm(cfg) else 0
+    if "triplo" in nline or "triple" in nline:
+        score += 1 if any(w in _norm(cfg) for w in ["trip", "tripl"]) else 0
+    if "quadru" in nline or "4" in nline:
+        score += 1 if any(w in _norm(cfg) for w in ["quadru", "4"]) else 0
+    return score
+
+def _remove_hotel_wide_info(s: str) -> str:
+    n = _norm(s)
+    for term in HOTEL_WIDE_TERMS:
+        if term in n:
+            # remove a sentença inteira contendo o termo
+            sentences = re.split(r"(?<=[.!?])\s+|\s*;\s*|\s*\|\s*", s)
+            keep = [t for t in sentences if _norm(t).find(term) == -1]
+            s = "; ".join([t.strip() for t in keep if t.strip()])
+            n = _norm(s)
+    return s.strip()
+
+def refine_description_for_quote(desc_block: str, categoria: str, cfg: str) -> str:
+    """
+    Recebe um bloco (às vezes com todas as categorias) e devolve apenas
+    a linha/trecho mais relevante para a categoria/config da cotação.
+    Se nada combinar, sintetiza a partir de categoria+config.
+    """
+    if not desc_block:
+        return ""
+
+    # 1) limpar preços e infos de hotel-wide
+    desc_block = strip_price_tokens(desc_block)
+    desc_block = _remove_hotel_wide_info(desc_block)
+
+    # 2) separar em linhas/itens
+    lines = _line_split_chunks(desc_block)
+    if not lines:
+        return ""
+
+    # 3) pontuar linhas por categoria/config
+    scored: List[Tuple[int, int, str]] = []  # (score_total, -len(line), line)
+    for ln in lines:
+        if not ln.strip():
+            continue
+        cat_score = _category_match_score(ln, categoria)
+        cfg_score = _config_match_score(ln, cfg)
+        total = cat_score * 3 + cfg_score  # dar mais peso para categoria
+        if total > 0:
+            scored.append((total, -len(ln), ln))
+
+    if scored:
+        scored.sort(reverse=True)
+        best = scored[0][2].strip()
+        return best
+
+    # 4) fallback: se nenhuma linha casou, tentar uma linha com categoria apenas
+    only_cat: List[Tuple[int, int, str]] = []
+    for ln in lines:
+        cat_score = _category_match_score(ln, categoria)
+        if cat_score > 0:
+            only_cat.append((cat_score, -len(ln), ln))
+    if only_cat:
+        only_cat.sort(reverse=True)
+        return only_cat[0][2].strip()
+
+    # 5) fallback final: sintetizar curto
+    cat = categoria.strip()
+    c = cfg.strip()
+    if cat and c:
+        return f"{cat}: {c}"
+    if cat:
+        return f"{cat}"
+    if c:
+        return f"{c}"
+    return ""
+
+
 def synthesize_room_description(quote: Dict[str, Any]) -> str:
-    """Se o LLM não preencheu 'Descrição dos Quartos', sintetiza uma mínima
-    usando campos já extraídos (categoria/configuração/nº de quartos)."""
+    """Se o LLM não preencheu 'Descrição dos Quartos' ou não casou nada,
+    sintetiza uma mínima usando campos já extraídos (categoria/config)."""
     cat = str(quote.get("Categoria do quarto", "") or "").strip()
     cfg = str(quote.get("Configuração do quarto", "") or "").strip()
-    nquartos = str(quote.get("Número de quartos", "") or "").strip()
-
-    parts = []
+    if cat and cfg:
+        return f"{cat}: {cfg}"
     if cat:
-        parts.append(f"Categoria: {cat}")
+        return f"{cat}"
     if cfg:
-        parts.append(f"Configuração de camas: {cfg}")
-    if nquartos:
-        parts.append(f"Número de quartos: {nquartos}")
-
-    desc = " | ".join(parts)
-    return desc if desc else ""
+        return f"{cfg}"
+    return ""
 
 
 # === Pipeline por arquivo ===
@@ -424,14 +591,21 @@ def enrich_and_validate_quote(quote: Dict[str, Any], body_text: str) -> Dict[str
             quote["Email do fornecedor"] = supplier
 
     # Preenchimento/limpeza de "Descrição dos Quartos"
-    desc = strip_price_tokens(str(quote.get("Descrição dos Quartos", "") or ""))
-    if not desc:
-        desc = synthesize_room_description(quote)
-    else:
-        # mesmo se veio do LLM, limpa potenciais preços residuais
-        desc = strip_price_tokens(desc)
+    raw_desc = str(quote.get("Descrição dos Quartos", "") or "")
+    desc = strip_price_tokens(raw_desc)
 
-    quote["Descrição dos Quartos"] = desc
+    # NOVO: refinar para a linha específica da categoria/config
+    desc_refined = refine_description_for_quote(
+        desc_block=desc,
+        categoria=str(quote.get("Categoria do quarto", "") or ""),
+        cfg=str(quote.get("Configuração do quarto", "") or "")
+    ).strip()
+
+    if not desc_refined:
+        # fallback de síntese curta
+        desc_refined = synthesize_room_description(quote)
+
+    quote["Descrição dos Quartos"] = desc_refined
 
     return quote
 
@@ -446,7 +620,7 @@ def process_file(
     out_incomplete: Path,
 ) -> List[Dict[str, Any]]:
     raw_text_pretty = read_text_any(path)
-    body_text = extract_body_from_rawtext(raw_text_pretty)
+    body_text = extract_body_from_rawtext(raw_text_prety := raw_text_pretty)  # mantém raw para debug
 
     # === Chamada ao LLM ===
     llm_text = call_llm(client, model, http_referer, x_title, raw_text_pretty)
@@ -502,7 +676,7 @@ def process_file(
 def main():
     load_env()
 
-    parser = argparse.ArgumentParser(description="Extrai **múltiplas** cotações por arquivo via OpenRouter LLM (campos atualizados).")
+    parser = argparse.ArgumentParser(description="Extrai **múltiplas** cotações por arquivo via OpenRouter LLM (campos atualizados, descrição específica por cotação).")
     parser.add_argument("--raw_dir", default=DEFAULT_RAW_DIR, help="Diretório com arquivos brutos (dump_threads).")
     parser.add_argument("--out_complete", default=DEFAULT_COMPLETE_DIR, help="Diretório para JSONs completos.")
     parser.add_argument("--out_incomplete", default=DEFAULT_INCOMPLETE_DIR, help="Diretório para JSONs incompletos/erros.")
