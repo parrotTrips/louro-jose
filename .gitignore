@@ -17,14 +17,13 @@ incomplete_data/
 complete_data/
 draft_emails/
 important_emails/
+examples/
+outputs/
+example_data/
 
 # Segredos
 credentials/
 
-examples/
-
-outputs/
-
-example_data/
-
-email_extractor/extracted_data.jsonl
+# Arquitetura
+diagrama_cloud_run.drawio
+diagrama_cloud_run.drawio.png
