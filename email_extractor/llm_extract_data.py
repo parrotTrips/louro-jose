@@ -1,4 +1,8 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+llm_extract_data.py (versão multi-cotações, sem aggregated JSONL)
+-----------------------------------------------------------------
 - Troca/Padronização de campos:
     "Tipo de quarto (normalizado)"                -> "Categoria do quarto"
     "Qual configuração do quarto (twin, double)"  -> "Configuração do quarto"
@@ -9,15 +13,14 @@
 Lê arquivos de `raw_messages/`, consulta um LLM (OpenRouter) e extrai **uma ou mais cotações**
 por arquivo — uma para **cada combinação distinta de categoria/configuração de quarto e preço**.
 
-Saídas:
-  - complete_data/: 1+ JSONs completos por arquivo de entrada (todos os HEADER_FIELDS preenchidos)
-  - incomplete_data/: 1+ JSONs incompletos (lista _missing_fields) OU erros de parsing/LLM
-  - extracted_data.jsonl: agregado com **uma linha por cotação**
+Saídas por cotação:
+  - complete_data/: JSON completo (todos os HEADER_FIELDS)
+  - incomplete_data/: JSON incompleto (com _missing_fields) ou erros de parsing
 
 Uso:
   python3 llm_extract_data.py
   python3 llm_extract_data.py --raw_dir raw_messages --out_complete complete_data --out_incomplete incomplete_data \
-      --model openai/gpt-4o --max_files 500
+      --model openai/gpt-4o --max_files 500 --log_level INFO --log_file logs/extract.log
 
 Requisitos:
   - pip install python-dotenv openai==1.*
@@ -32,39 +35,43 @@ import re
 import sys
 import time
 import unicodedata
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Union
 
 from dotenv import load_dotenv
+from modules.headers import HEADER_FIELDS
+
+# === logging ===
+LOGGER_NAME = "llm_extract"
+logger = logging.getLogger(LOGGER_NAME)
+
+def setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    logger.setLevel(lvl)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(lvl)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    if log_file:
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setLevel(lvl)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
 
 # === Config de pastas padrão ===
 DEFAULT_RAW_DIR = "raw_messages"
 DEFAULT_COMPLETE_DIR = "complete_data"
 DEFAULT_INCOMPLETE_DIR = "incomplete_data"
-DEFAULT_JSONL_AGG = "extracted_data.jsonl"
-
-# === Campos a serem extraídos (por cotação) — ATUALIZADOS ===
-HEADER_FIELDS: List[str] = [
-    "Timestamp",
-    "Fornecedor",
-    "Assunto",
-    "Nome do hotel",
-    "Cidade",
-    "Check-in",
-    "Check-out",
-    "Número de quartos",
-    "Descrição dos Quartos",                      # texto específico da cotação (categoria/config/observações do quarto) — sem preços
-    "Categoria do quarto",
-    "Preço (num)",
-    "Configuração do quarto",
-    "Tarifa NET ou comissionada?",
-    "Taxa? Ex.: 5% de ISS",
-    "Serviços incluso? Explicação: existem hotéis que consideram a tarifa de serviço já incluso e outros não.",
-    "Política de pagamento",
-    "Política de cancelamento",
-    "Email do fornecedor",
-    "Email do remetente (top-level)",
-]
 
 # === Prompt do LLM (ATUALIZADO) ===
 SYSTEM_PROMPT = (
@@ -143,13 +150,11 @@ Conteúdo do e-mail/thread (texto/JSON bruto):
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
-
 def _load_if_json(txt: str) -> Optional[dict]:
     try:
         return json.loads(txt)
     except Exception:
         return None
-
 
 def read_text_any(path: Path) -> str:
     """Lê como texto, mas se for JSON retorna uma versão pretty (melhor para o LLM)."""
@@ -162,7 +167,6 @@ def read_text_any(path: Path) -> str:
     except Exception as e:
         return f"<<ERRO AO LER ARQUIVO: {e}>>"
 
-
 def extract_body_from_rawtext(raw_text: str) -> str:
     obj = _load_if_json(raw_text)
     if isinstance(obj, dict):
@@ -173,9 +177,7 @@ def extract_body_from_rawtext(raw_text: str) -> str:
             return md["body"]
     return raw_text
 
-
 EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.UNICODE)
-
 
 def extract_top_from_email(body_text: str) -> str:
     head = body_text[:3000]
@@ -186,7 +188,6 @@ def extract_top_from_email(body_text: str) -> str:
                 return m.group(0).strip()
     m = EMAIL_REGEX.search(head)
     return m.group(0).strip() if m else ""
-
 
 def extract_supplier_email_heuristic(body_text: str) -> str:
     ignore_domains = {
@@ -213,7 +214,6 @@ def extract_supplier_email_heuristic(body_text: str) -> str:
         return candidates_regular[0]
     return ""
 
-
 def coerce_price(value: Any) -> Any:
     if value is None:
         return ""
@@ -222,7 +222,6 @@ def coerce_price(value: Any) -> Any:
     s = str(value).strip()
     if not s:
         return ""
-    # BR: "1.234,56" | US: "1,234.56" | simples: "1234,56" or "1234.56"
     if s.count(",") == 1 and s.count(".") > 1:
         s = s.replace(".", "").replace(",", ".")
     else:
@@ -232,19 +231,16 @@ def coerce_price(value: Any) -> Any:
     except Exception:
         return ""
 
-
 def sanitize_json_only(s: str) -> str:
     start = s.find("[")
     end = s.rfind("]")
     if start == -1 or end == -1 or end < start:
-        # fallback: tenta objeto simples
         start_obj = s.find("{")
         end_obj = s.rfind("}")
         if start_obj != -1 and end_obj != -1 and end_obj >= start_obj:
             return s[start_obj : end_obj + 1]
         return s
     return s[start : end + 1]
-
 
 def complete_check(record: Dict[str, Any], required_fields: List[str]) -> Tuple[bool, List[str]]:
     missing = []
@@ -259,13 +255,10 @@ def complete_check(record: Dict[str, Any], required_fields: List[str]) -> Tuple[
                 missing.append(k)
     return (len(missing) == 0, missing)
 
-
 def load_env() -> None:
     load_dotenv()
 
-
 # === OpenRouter (SDK OpenAI) ===
-
 def make_client():
     from openai import OpenAI
     base_url = "https://openrouter.ai/api/v1"
@@ -274,7 +267,6 @@ def make_client():
         raise RuntimeError("Defina OPENROUTER_API_KEY no ambiente ou .env")
     client = OpenAI(base_url=base_url, api_key=api_key)
     return client
-
 
 def call_llm(client, model: str, http_referer: str | None, x_title: str | None, email_text: str) -> str:
     extra_headers = {}
@@ -305,11 +297,11 @@ def call_llm(client, model: str, http_referer: str | None, x_title: str | None, 
         except Exception as e:
             if attempt < max_retries:
                 sleep_s = base_delay * (2 ** (attempt - 1))
-                print(f"⚠️  LLM erro (tentativa {attempt}/{max_retries}): {e}. Retentando em {sleep_s:.1f}s...")
+                logger.warning(f"LLM erro (tentativa {attempt}/{max_retries}): {e}. Retentando em {sleep_s:.1f}s...")
                 time.sleep(sleep_s)
                 continue
+            logger.exception("Falha definitiva ao chamar o LLM")
             raise
-
 
 def parse_llm_to_list(text: str) -> List[Dict[str, Any]]:
     """Converte a resposta do LLM para **lista de objetos**.
@@ -333,29 +325,7 @@ def parse_llm_to_list(text: str) -> List[Dict[str, Any]]:
 
     return []
 
-
-# === Compatibilidade retroativa de chaves antigas -> novas ===
-
-OLD_TO_NEW_KEYS = {
-    "Tipo de quarto (normalizado)": "Categoria do quarto",
-    "Qual configuração do quarto (twin, double)": "Configuração do quarto",
-    "Descrição de Valores": "Descrição dos Quartos",
-    "Descrição de Quartos": "Descrição dos Quartos",
-    "Descrição do Quarto": "Descrição dos Quartos",
-}
-
-def normalize_key_aliases(d: Dict[str, Any]) -> Dict[str, Any]:
-    if not d:
-        return d
-    out = dict(d)
-    for old_k, new_k in OLD_TO_NEW_KEYS.items():
-        if old_k in out and new_k not in out:
-            out[new_k] = out.pop(old_k)
-    return out
-
-
 # === Helpers de pós-processamento ===
-
 _PRICE_TOKEN_RE = re.compile(
     r"(R\$\s?\d[\d\.\,]*|\$\s?\d[\d\.\,]*|\b\d{1,3}(\.\d{3})*(,\d+)?\b)",
     re.IGNORECASE,
@@ -379,7 +349,6 @@ def strip_price_tokens(text: str) -> str:
     cleaned = "\n".join(line.rstrip() for line in cleaned.splitlines())
     return cleaned.strip()
 
-
 def _norm(s: str) -> str:
     """Normaliza para comparação (lower, sem acento)."""
     s = s or ""
@@ -389,20 +358,17 @@ def _norm(s: str) -> str:
     return s
 
 def _line_split_chunks(text: str) -> List[str]:
-    """Separa bloco em linhas/cartos curtos: por quebras de linha e bullets."""
+    """Separa bloco em linhas/itens curtos: por quebras de linha e bullets."""
     if not text:
         return []
-    # quebra em bullets '•' ou hífens ou quebras
     parts = re.split(r"(?:\n|\r|\r\n|^)\s*[•\-–]\s*|[\r\n]+", text)
     parts = [p.strip(" \t;,.") for p in parts if p and p.strip()]
-    # juntar linhas muito curtas que provavelmente foram quebradas no meio
     joined: List[str] = []
     buf = ""
     for p in parts:
         if not buf:
             buf = p
         else:
-            # Heurística: se terminou sem ponto e a próxima começa minúscula, pode ser continuação
             if (not re.search(r"[.;:]$", buf)) and re.match(r"^[a-zà-ú0-9]", _norm(p)):
                 buf = f"{buf} {p}"
             else:
@@ -413,16 +379,14 @@ def _line_split_chunks(text: str) -> List[str]:
     return joined
 
 def _config_keywords(cfg: str) -> List[str]:
-    """Extrai palavras-chave de configuração e seus sinônimos comuns."""
     n = _norm(cfg)
     keys: set[str] = set()
     if not n:
         return []
-    # básicos
     if "sgl" in n or "single" in n or "individual" in n:
         keys.update(["sgl", "single", "individual", "single/individual"])
     if "dbl" in n or "duplo" in n or "double" in n or "casal" in n:
-        keys.update(["dbl", "duplo", "double", "casal", "s/d"])  # s/d às vezes aparece como abreviação
+        keys.update(["dbl", "duplo", "double", "casal", "s/d"])
     if "twin" in n or "duas camas" in n or "2 twin" in n or "solteiro" in n:
         keys.update(["twin", "2 twin", "duas camas", "solteiro", "2 solteiro", "duas de solteiro"])
     if "trip" in n or "tripl" in n or "3" in n:
@@ -438,13 +402,9 @@ def _config_keywords(cfg: str) -> List[str]:
     return sorted(keys)
 
 def _category_match_score(line: str, categoria: str) -> int:
-    nline = _norm(line)
-    ncat = _norm(categoria)
-    score = 0
-    # match direto do nome da categoria
+    nline = _norm(line); ncat = _norm(categoria); score = 0
     if ncat and ncat in nline:
         score += 2
-    # reforços por aliases comuns
     aliases = {
         "standard": ["std", "standard"],
         "superior": ["superior"],
@@ -455,24 +415,20 @@ def _category_match_score(line: str, categoria: str) -> int:
         "premium": ["premium"],
     }
     for k, vals in aliases.items():
-        if k in ncat:
-            if any(val in nline for val in vals):
-                score += 1
-    # pistas de que é cabeçalho de categoria
+        if k in ncat and any(val in nline for val in vals):
+            score += 1
     if re.match(r"^(categoria|apto\.?|apartamento|standard|superior|luxo|deluxe|classic)\b", nline):
         score += 1
     return score
 
 def _config_match_score(line: str, cfg: str) -> int:
-    nline = _norm(line)
-    keys = _config_keywords(cfg)
+    nline = _norm(line); keys = _config_keywords(cfg)
     if not keys:
         return 0
     score = 0
     for k in keys:
         if k in nline:
             score += 1
-    # padrões de ocupação
     if any(w in nline for w in ["single", "individual"]):
         score += 1 if any(w in _norm(cfg) for w in ["single", "individual", "sgl"]) else 0
     if any(w in nline for w in ["duplo", "double", "casal"]):
@@ -489,7 +445,6 @@ def _remove_hotel_wide_info(s: str) -> str:
     n = _norm(s)
     for term in HOTEL_WIDE_TERMS:
         if term in n:
-            # remove a sentença inteira contendo o termo
             sentences = re.split(r"(?<=[.!?])\s+|\s*;\s*|\s*\|\s*", s)
             keep = [t for t in sentences if _norm(t).find(term) == -1]
             s = "; ".join([t.strip() for t in keep if t.strip()])
@@ -497,40 +452,25 @@ def _remove_hotel_wide_info(s: str) -> str:
     return s.strip()
 
 def refine_description_for_quote(desc_block: str, categoria: str, cfg: str) -> str:
-    """
-    Recebe um bloco (às vezes com todas as categorias) e devolve apenas
-    a linha/trecho mais relevante para a categoria/config da cotação.
-    Se nada combinar, sintetiza a partir de categoria+config.
-    """
     if not desc_block:
         return ""
-
-    # 1) limpar preços e infos de hotel-wide
     desc_block = strip_price_tokens(desc_block)
     desc_block = _remove_hotel_wide_info(desc_block)
-
-    # 2) separar em linhas/itens
     lines = _line_split_chunks(desc_block)
     if not lines:
         return ""
-
-    # 3) pontuar linhas por categoria/config
-    scored: List[Tuple[int, int, str]] = []  # (score_total, -len(line), line)
+    scored: List[Tuple[int, int, str]] = []
     for ln in lines:
         if not ln.strip():
             continue
         cat_score = _category_match_score(ln, categoria)
         cfg_score = _config_match_score(ln, cfg)
-        total = cat_score * 3 + cfg_score  # dar mais peso para categoria
+        total = cat_score * 3 + cfg_score
         if total > 0:
             scored.append((total, -len(ln), ln))
-
     if scored:
         scored.sort(reverse=True)
-        best = scored[0][2].strip()
-        return best
-
-    # 4) fallback: se nenhuma linha casou, tentar uma linha com categoria apenas
+        return scored[0][2].strip()
     only_cat: List[Tuple[int, int, str]] = []
     for ln in lines:
         cat_score = _category_match_score(ln, categoria)
@@ -539,76 +479,45 @@ def refine_description_for_quote(desc_block: str, categoria: str, cfg: str) -> s
     if only_cat:
         only_cat.sort(reverse=True)
         return only_cat[0][2].strip()
-
-    # 5) fallback final: sintetizar curto
-    cat = categoria.strip()
-    c = cfg.strip()
-    if cat and c:
-        return f"{cat}: {c}"
-    if cat:
-        return f"{cat}"
-    if c:
-        return f"{c}"
+    cat = (categoria or "").strip(); c = (cfg or "").strip()
+    if cat and c: return f"{cat}: {c}"
+    if cat: return f"{cat}"
+    if c: return f"{c}"
     return ""
-
 
 def synthesize_room_description(quote: Dict[str, Any]) -> str:
-    """Se o LLM não preencheu 'Descrição dos Quartos' ou não casou nada,
-    sintetiza uma mínima usando campos já extraídos (categoria/config)."""
     cat = str(quote.get("Categoria do quarto", "") or "").strip()
     cfg = str(quote.get("Configuração do quarto", "") or "").strip()
-    if cat and cfg:
-        return f"{cat}: {cfg}"
-    if cat:
-        return f"{cat}"
-    if cfg:
-        return f"{cfg}"
+    if cat and cfg: return f"{cat}: {cfg}"
+    if cat: return f"{cat}"
+    if cfg: return f"{cfg}"
     return ""
 
-
 # === Pipeline por arquivo ===
-
 def enrich_and_validate_quote(quote: Dict[str, Any], body_text: str) -> Dict[str, Any]:
-    # Normaliza possíveis chaves antigas para as novas
-    quote = normalize_key_aliases(quote)
-
-    # Garante chaves e normaliza preço
     for field in HEADER_FIELDS:
         if field not in quote:
             quote[field] = ""
-
     quote["Preço (num)"] = coerce_price(quote.get("Preço (num)"))
-
-    # Heurísticas para e-mails
     if not str(quote.get("Email do remetente (top-level)", "")).strip():
         top_from = extract_top_from_email(body_text)
         if top_from:
             quote["Email do remetente (top-level)"] = top_from
-
     if not str(quote.get("Email do fornecedor", "")).strip():
         supplier = extract_supplier_email_heuristic(body_text)
         if supplier:
             quote["Email do fornecedor"] = supplier
-
-    # Preenchimento/limpeza de "Descrição dos Quartos"
     raw_desc = str(quote.get("Descrição dos Quartos", "") or "")
     desc = strip_price_tokens(raw_desc)
-
-    # NOVO: refinar para a linha específica da categoria/config
     desc_refined = refine_description_for_quote(
         desc_block=desc,
         categoria=str(quote.get("Categoria do quarto", "") or ""),
         cfg=str(quote.get("Configuração do quarto", "") or "")
     ).strip()
-
     if not desc_refined:
-        # fallback de síntese curta
         desc_refined = synthesize_room_description(quote)
-
     quote["Descrição dos Quartos"] = desc_refined
-
     return quote
-
 
 def process_file(
     client,
@@ -620,7 +529,7 @@ def process_file(
     out_incomplete: Path,
 ) -> List[Dict[str, Any]]:
     raw_text_pretty = read_text_any(path)
-    body_text = extract_body_from_rawtext(raw_text_prety := raw_text_pretty)  # mantém raw para debug
+    body_text = extract_body_from_rawtext(raw_text_pretty)  # fix typo
 
     # === Chamada ao LLM ===
     llm_text = call_llm(client, model, http_referer, x_title, raw_text_pretty)
@@ -641,19 +550,19 @@ def process_file(
         }]
         out_path = out_incomplete / (path.stem + "__parsed_error.json")
         out_path.write_text(json.dumps(payload[0], ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.error(f"[{path.name}] Erro de parsing do JSON do LLM: {e}")
         return payload
 
-    # Se o modelo não retornou nada útil, registre um vazio
     if not quotes:
         err = {**meta_base, "_error": "EMPTY_RESULT_FROM_LLM"}
         (out_incomplete / (path.stem + "__empty_result.json")).write_text(
             json.dumps(err, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        logger.warning(f"[{path.name}] Resposta vazia do LLM.")
         return [err]
 
     results: List[Dict[str, Any]] = []
 
-    # === Enriquecimento, validação e gravação 1:1 por cotação ===
     for idx, q in enumerate(quotes, start=1):
         q = enrich_and_validate_quote(q, body_text)
         is_complete, missing = complete_check(q, HEADER_FIELDS)
@@ -661,61 +570,68 @@ def process_file(
         if not is_complete:
             out_obj["_missing_fields"] = missing
 
-        # Decide pasta e nomeia com índice
         if is_complete:
             out_path = out_complete / f"{path.stem}__extracted_{idx:02d}.json"
+            logger.info(f"[{path.name}] Cotação {idx:02d}: COMPLETA → {out_path.name}")
         else:
             out_path = out_incomplete / f"{path.stem}__extracted_incomplete_{idx:02d}.json"
+            logger.info(f"[{path.name}] Cotação {idx:02d}: INCOMPLETA (faltam: {', '.join(missing)}) → {out_path.name}")
 
         out_path.write_text(json.dumps(out_obj, ensure_ascii=False, indent=2), encoding="utf-8")
         results.append(out_obj)
 
     return results
 
-
 def main():
     load_env()
 
-    parser = argparse.ArgumentParser(description="Extrai **múltiplas** cotações por arquivo via OpenRouter LLM (campos atualizados, descrição específica por cotação).")
+    parser = argparse.ArgumentParser(
+        description="Extrai **múltiplas** cotações por arquivo via OpenRouter LLM (campos atualizados, descrição específica por cotação)."
+    )
     parser.add_argument("--raw_dir", default=DEFAULT_RAW_DIR, help="Diretório com arquivos brutos (dump_threads).")
     parser.add_argument("--out_complete", default=DEFAULT_COMPLETE_DIR, help="Diretório para JSONs completos.")
     parser.add_argument("--out_incomplete", default=DEFAULT_INCOMPLETE_DIR, help="Diretório para JSONs incompletos/erros.")
-    parser.add_argument("--jsonl_out", default=DEFAULT_JSONL_AGG, help="Arquivo agregado JSONL (raiz do projeto).")
     parser.add_argument("--model", default=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"), help="Modelo OpenRouter (ex.: openai/gpt-4o).")
     parser.add_argument("--http_referer", default=os.getenv("OPENROUTER_HTTP_REFERER", "").strip(), help="HTTP-Referer (ranking OpenRouter).")
     parser.add_argument("--x_title", default=os.getenv("OPENROUTER_X_TITLE", "").strip(), help="X-Title (ranking OpenRouter).")
     parser.add_argument("--max_files", type=int, default=0, help="Limite opcional de arquivos para processar (0 = todos).")
+    parser.add_argument("--log_level", default=os.getenv("LOG_LEVEL", "INFO"), help="Nível de log (DEBUG, INFO, WARNING, ERROR).")
+    parser.add_argument("--log_file", default=os.getenv("LOG_FILE", ""), help="Caminho opcional para salvar o log em arquivo.")
     args = parser.parse_args()
+
+    setup_logging(args.log_level, args.log_file if args.log_file else None)
 
     raw_dir = Path(args.raw_dir)
     out_complete = Path(args.out_complete)
     out_incomplete = Path(args.out_incomplete)
-    jsonl_out = Path(args.jsonl_out)
 
     if not raw_dir.exists():
-        print(f"❌ Diretório não encontrado: {raw_dir}")
+        logger.error(f"Diretório não encontrado: {raw_dir}")
         sys.exit(1)
 
     ensure_dir(out_complete)
     ensure_dir(out_incomplete)
 
-    client = make_client()
+    try:
+        client = make_client()
+    except Exception as e:
+        logger.exception("Falha criando cliente OpenRouter")
+        sys.exit(2)
 
     files = sorted([p for p in raw_dir.glob("**/*") if p.is_file() and not p.name.startswith(".")])
     if args.max_files > 0:
         files = files[: args.max_files]
 
     if not files:
-        print("⚠️  Nenhum arquivo encontrado em raw_messages/.")
+        logger.warning("Nenhum arquivo encontrado em raw_messages/.")
         sys.exit(0)
 
-    print(f"🧠 Extração via LLM em {len(files)} arquivo(s) de {raw_dir}/ — múltiplas cotações por arquivo habilitadas (campos novos)")
+    logger.info(f"🧠 Processando {len(files)} arquivo(s) de {raw_dir}/ — múltiplas cotações por arquivo (campos novos)")
 
-    aggregated: List[Dict[str, Any]] = []
-    ok_quotes, bad_quotes = 0, 0
+    ok_quotes, bad_quotes, total_files = 0, 0, len(files)
 
     for i, f in enumerate(files, 1):
-        print(f"[{i}/{len(files)}] → {f.name}")
+        logger.info(f"[{i}/{total_files}] → {f.name}")
         try:
             out_list = process_file(
                 client=client,
@@ -727,7 +643,6 @@ def main():
                 out_incomplete=out_incomplete,
             )
             for row in out_list:
-                aggregated.append(row)
                 if ("_missing_fields" in row) or ("_error" in row):
                     bad_quotes += 1
                 else:
@@ -742,20 +657,12 @@ def main():
                 json.dumps(err_obj, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            aggregated.append(err_obj)
+            logger.exception(f"[{f.name}] Falha no processamento do arquivo")
             bad_quotes += 1
 
-    # Salva agregado (uma linha por cotação)
-    try:
-        with jsonl_out.open("w", encoding="utf-8") as fp:
-            for row in aggregated:
-                fp.write(json.dumps(row, ensure_ascii=False) + "\n")
-        print(f"\n📦 Agregado salvo em: {jsonl_out}")
-    except Exception as e:
-        print(f"⚠️  Falha ao salvar JSONL agregado ({jsonl_out}): {e}")
-
-    print(f"\n✅ Cotações completas: {ok_quotes} | ⚠️ Cotações incompletas/erros: {bad_quotes} | Total de cotações: {ok_quotes + bad_quotes}")
-
+    logger.info(
+        f"✅ Cotações completas: {ok_quotes} | ⚠️ Incompletas/erros: {bad_quotes} | Total de cotações: {ok_quotes + bad_quotes}"
+    )
 
 if __name__ == "__main__":
     main()
