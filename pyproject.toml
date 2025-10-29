@@ -1,0 +1,18 @@
+[project]
+name = "louro-jose"
+version = "0.1.0"
+description = "Pipeline (Gmail -> GCS -> Parser -> Sheets) pronto para Cloud Run."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.5",
+  "pydantic-settings>=2.4",
+  "python-dotenv>=1.0",
+]
+
+[tool.pdm]
+# se usar pdm/poetry depois, mantemos compatível
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

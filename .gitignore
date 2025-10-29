@@ -1,29 +1,29 @@
-# venvs
-env/
-.env
-
 # Python
-**/__pycache__/
-*.py[cod]
-
-# Dotenv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.build/
+dist/
+.venv/
+venv/
 .env
 .env.*
+!.env.template
+env/
 
-# Saídas
-raw_messages/
-token_files/
-incomplete_data/
-complete_data/
-draft_emails/
-important_emails/
-examples/
-outputs/
-example_data/
+# IDE
+.vscode/
+.idea/
 
-# Segredos
+# Credenciais / artefatos locais
 credentials/
+token_files/
+*.json
+*.pem
 
-# Arquitetura
-diagrama_cloud_run.drawio
-diagrama_cloud_run.drawio.png
+# Dados locais que não vão para o Git
+.raw/
+.parsed/
+.state/
