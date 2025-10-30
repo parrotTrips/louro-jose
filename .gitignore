@@ -12,6 +12,7 @@ venv/
 .env.*
 !.env.template
 env/
+tokens/
 
 # IDE
 .vscode/

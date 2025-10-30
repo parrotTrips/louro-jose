@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from functools import lru_cache
 from typing import Optional
 from pydantic import Field, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -36,6 +37,7 @@ class AppConfig(BaseSettings):
 
 
 def load_config() -> AppConfig:
+    """Carrega a configuração diretamente do ambiente/.env (sem cache)."""
     try:
         cfg = AppConfig()  # lê de env + .env
     except ValidationError as ve:
@@ -65,6 +67,18 @@ def load_config() -> AppConfig:
     return cfg
 
 
+@lru_cache
+def get_settings() -> AppConfig:
+    """Versão com cache (idempotente) para ser usada pelo resto do projeto."""
+    return load_config()
+
+
+# Compat: permite `from app.core.config import settings`
+settings: AppConfig = get_settings()
+
+__all__ = ["AppConfig", "ConfigError", "load_config", "get_settings", "settings"]
+
+
 def _print_ok(cfg: AppConfig) -> None:
     print("✅ Config carregada com sucesso:")
     print(f"- GCP_PROJECT_ID = {cfg.gcp_project_id}")
@@ -76,7 +90,7 @@ def _print_ok(cfg: AppConfig) -> None:
 if __name__ == "__main__":
     # Smoke test: `python -m app.core.config` quando estiver no PYTHONPATH correto
     try:
-        cfg = load_config()
+        cfg = get_settings()  # usa a versão cacheada
         _print_ok(cfg)
         sys.exit(0)
     except ConfigError as e:
