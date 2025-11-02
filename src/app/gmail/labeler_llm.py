@@ -1,22 +1,20 @@
-"""
-labeler_llm.py — Rotula THREADS inteiras como "QUOTES" usando apenas LLM (OpenRouter).
-
-Como funciona:
-- Busca threads via query (ex.: newer_than:60d in:anywhere).
-- Para cada thread, monta um "preview" textual (Subject + corpo das mensagens).
-- Envia o preview ao LLM pedindo um JSON estrito {is_quote, confidence, reason}.
-- Se is_quote == true, aplica o rótulo na THREAD inteira (gmail.modify).
-
-Requisitos:
-- pip install requests python-dateutil google-api-python-client google-auth-httplib2 google-auth-oauthlib
-- .env com:
-    OPENROUTER_API_KEY=...
-    OPENROUTER_MODEL=gpt-4o-mini        (opcional; tem default)
-    OPENROUTER_BASE=https://openrouter.ai/api/v1  (opcional)
-    QUOTES_LABEL_NAME=QUOTES            (opcional)
-    GMAIL_CLIENT_SECRETS=credentials/real-credentials-parrots-gmail.json
-    GMAIL_TOKEN_FILE_MODIFY=tokens/gmail_token_modify.json   (opcional)
-"""
+# labeler_llm.py — Rotula THREADS inteiras como "QUOTES" usando apenas LLM (OpenRouter).
+#
+# Como funciona:
+# - Busca threads via query (ex.: newer_than:60d in:anywhere).
+# - Para cada thread, monta um "preview" textual (Subject + corpo das mensagens).
+# - Envia o preview ao LLM pedindo um JSON estrito {is_quote, confidence, reason}.
+# - Se is_quote == true, aplica o rótulo na THREAD inteira (gmail.modify).
+#
+# Requisitos:
+# - pip install requests python-dateutil google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dotenv
+# - .env com:
+#     OPENROUTER_API_KEY=...
+#     OPENROUTER_MODEL=gpt-4o-mini                 (opcional; tem default)
+#     OPENROUTER_BASE=https://openrouter.ai/api/v1 (opcional)
+#     QUOTES_LABEL_NAME=QUOTES                     (opcional)
+#     GMAIL_CLIENT_SECRETS=credentials/real-credentials-parrots-gmail.json
+#     GMAIL_TOKEN_FILE_MODIFY=tokens/gmail_token_modify.json   (opcional)
 
 from __future__ import annotations
 
@@ -31,6 +29,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.auth.transport.requests import Request  # ← refresh correto
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -65,7 +64,7 @@ def build_gmail_service_modify():
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
-                creds.refresh(request=None)
+                creds.refresh(Request())  # ← correção importante
             except Exception:
                 creds = None
         if not creds:
@@ -97,16 +96,6 @@ def search_thread_ids(service, q: str, max_pages: int = 50) -> List[str]:
         if not page_token or pages >= max_pages:
             break
     return out
-
-def thread_has_label(service, thread_id: str, label_id: str) -> bool:
-    th = service.users().threads().get(userId=GMAIL_USER, id=thread_id, format="minimal").execute()
-    # minimal não retorna mensagens; usamos threads().get(full) abaixo para preview.
-    # Aqui apenas checamos rápido com messages().get seria por msg; então vamos pelo full:
-    th_full = service.users().threads().get(userId=GMAIL_USER, id=thread_id, format="full").execute()
-    for msg in th_full.get("messages", []):
-        if label_id in set(msg.get("labelIds", [])):
-            return True
-    return False
 
 def add_label_to_thread(service, thread_id: str, label_id: str) -> None:
     service.users().threads().modify(
@@ -166,9 +155,7 @@ def _get_header(msg: Dict, name: str) -> str:
     return ""
 
 def build_thread_preview(thread_full: Dict, max_chars: int = 9000) -> str:
-    """
-    Monta um preview concatenando Subject + trechos de corpo das mensagens.
-    """
+    """Monta um preview concatenando Subject + trechos de corpo das mensagens."""
     chunks: List[str] = []
     for i, msg in enumerate(thread_full.get("messages", []), 1):
         subject = _get_header(msg, "Subject")
@@ -180,9 +167,10 @@ def build_thread_preview(thread_full: Dict, max_chars: int = 9000) -> str:
 
 # ======= LLM (OpenRouter) =======
 
-def classify_thread_with_llm(thread_preview: str, timeout_s: int = 60, retries: int = 3, backoff: float = 2.0) -> bool:
+def classify_thread_with_llm(thread_preview: str, timeout_s: int = 60, retries: int = 3, backoff: float = 2.0) -> Dict:
     """
-    Classifica via LLM. Retorna True se deve rotular como QUOTES.
+    Classifica via LLM. Retorna um dict:
+      {"is_quote": bool, "confidence": float, "reason": str}
     Exige OPENROUTER_API_KEY. Usa response_format JSON.
     """
     if not OPENROUTER_API_KEY:
@@ -225,7 +213,12 @@ def classify_thread_with_llm(thread_preview: str, timeout_s: int = 60, retries: 
             data = r.json()
             content = data["choices"][0]["message"]["content"]
             parsed = json.loads(content)
-            return bool(parsed.get("is_quote", False))
+            # Sanitiza campos esperados
+            return {
+                "is_quote": bool(parsed.get("is_quote", False)),
+                "confidence": float(parsed.get("confidence", 0.0)),
+                "reason": str(parsed.get("reason", ""))[:500],
+            }
         except Exception as e:
             last_err = e
             if attempt < retries:
@@ -243,7 +236,7 @@ def process_threads_llm_only(
 ) -> Dict[str, int]:
     """
     Percorre threads pela query, pergunta ao LLM e aplica label se is_quote==true.
-    Retorna estatísticas.
+    Retorna estatísticas: {"threads","messages","threads_labeled","llm_calls"}.
     """
     service = build_gmail_service_modify()
     label_id = get_or_create_label_id(service, label_name)
@@ -265,14 +258,15 @@ def process_threads_llm_only(
                 already = True
                 break
         if already:
+            # ainda contamos mensagens para telemetria
+            stats["messages"] += len(thread_full.get("messages", []))
             continue
 
         # monta preview e classifica
         preview = build_thread_preview(thread_full)
         stats["llm_calls"] += 1
-        is_quote = classify_thread_with_llm(preview)
-
-        if is_quote:
+        decision = classify_thread_with_llm(preview)
+        if decision.get("is_quote", False):
             add_label_to_thread(service, th_id, label_id)
             stats["threads_labeled"] += 1
 
@@ -282,6 +276,23 @@ def process_threads_llm_only(
         if sleep_between:
             time.sleep(sleep_between)
 
+    return stats
+
+# ======= ENTRYPOINT PROGRAMÁTICO (para a main) =======
+
+def run(q: str, label: str = DEFAULT_LABEL_NAME, limit: int = 100, sleep: float = 0.0) -> Dict[str, int]:
+    """
+    Entry-point programático para uso via import na sua `main`.
+    Exemplo:
+        from app.gmail.labeler_llm import run as labeler_run
+        stats = labeler_run(q="newer_than:30d in:anywhere -label:QUOTES", label="QUOTES", limit=200)
+    """
+    stats = process_threads_llm_only(
+        q=q,
+        label_name=label,
+        hard_limit_threads=(limit or None),
+        sleep_between=sleep,
+    )
     return stats
 
 # ======= CLI =======
@@ -303,11 +314,11 @@ if __name__ == "__main__":
             hard_limit_threads=(args.limit or None),
             sleep_between=args.sleep,
         )
-        print("✅ Finalizado.")
-        print(stats)
+        # Saída 100% JSON (fácil de parsear pela sua main, se cair no fallback)
+        print(json.dumps({"ok": True, "stats": stats}, ensure_ascii=False))
     except HttpError as e:
-        print(f"❌ Erro Gmail API: {e}")
+        print(json.dumps({"ok": False, "error": f"Gmail API: {e}"}, ensure_ascii=False))
     except FileNotFoundError as e:
-        print(f"❌ Arquivo não encontrado: {e}")
+        print(json.dumps({"ok": False, "error": f"Arquivo não encontrado: {e}"}, ensure_ascii=False))
     except Exception as e:
-        print(f"❌ Erro inesperado: {e}")
+        print(json.dumps({"ok": False, "error": f"Erro inesperado: {e}"}, ensure_ascii=False))

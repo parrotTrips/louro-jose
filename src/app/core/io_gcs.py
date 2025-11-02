@@ -13,6 +13,8 @@ O QUE ESTE MÓDULO FAZ
    - save_json_to_gcs(bucket, path, data): grava um dicionário como JSON (UTF-8)
    - load_json_from_gcs(bucket, path): lê JSON e retorna um dicionário
    - object_exists_in_gcs(bucket, path): verifica se o objeto existe
+   - list_objects(bucket, prefix, delimiter=None): lista objetos sob um prefixo
+   - iter_objects(bucket, prefix, delimiter=None): iterador para grandes listagens
 
 3) Implementa um retry simples para erros temporários do GCS (429/503/timeout).
 
@@ -26,7 +28,7 @@ COMO USAR (resumo)
         path_state_last_history_id, save_json_to_gcs, load_json_from_gcs
     )
 
-    bucket = "meu-bucket" (Vou usar do dotenv aqui)
+    bucket = "meu-bucket" (pego do dotenv via load_config() se você não passar)
     p = path_state_last_history_id()
     save_json_to_gcs(bucket, p, {"last_history_id": 0})
     data = load_json_from_gcs(bucket, p)
@@ -40,11 +42,12 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, List, Optional
 
 from google.cloud import storage
 from google.api_core import exceptions as gcs_err
-from app.core.config import load_config
+
+from app.core.config import load_config  # seu loader de .env/settings
 
 # ==============================
 # 1) CONSTRUÇÃO DE CAMINHOS
@@ -72,6 +75,15 @@ def path_parsed(thread_id: str, message_id: str, sha1short: str) -> str:
     Ex.: parsed/1748d8a93be/183a45...__a1b2c3d4.json
     """
     return f"parsed/{thread_id}/{message_id}__{sha1short}.json"
+
+# ---- Aliases de compatibilidade com outros módulos ----
+def build_raw_path(thread_id: str, message_id: str) -> str:
+    """Alias compatível: alguns módulos chamam build_raw_path(...)."""
+    return path_raw(thread_id, message_id)
+
+def path_raw_message(thread_id: str, message_id: str) -> str:
+    """Alias compatível: alguns módulos chamam path_raw_message(...)."""
+    return path_raw(thread_id, message_id)
 
 
 # ==============================
@@ -148,10 +160,8 @@ def save_json_to_gcs(bucket_name: str, blob_path: str, data: Dict[str, Any]) -> 
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(blob_path)
 
-        # Serializa o dicionário para JSON bonito e codifica em UTF-8
         payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
 
-        # Envia para o GCS
         blob.upload_from_string(
             payload,
             content_type="application/json; charset=utf-8",
@@ -200,12 +210,75 @@ def object_exists_in_gcs(bucket_name: str, blob_path: str) -> bool:
     return _with_simple_retry(_op, op_name=f"verificar existência de '{blob_path}'")
 
 
+# ==============================
+# 5) LISTAGEM DE OBJETOS (compatível com chamadas antigas)
+# ==============================
+
+def _resolve_bucket_and_prefix(args, kwargs):
+    """
+    Suporta:
+      - Novo formato (recomendado): (bucket_name, prefix, delimiter=None)
+      - Antigo (sem bucket): passava só prefix por kwargs/positional → busca bucket do .env
+    """
+    bucket_name = kwargs.get("bucket_name")
+    prefix = kwargs.get("prefix", "")
+    delimiter = kwargs.get("delimiter", None)
+
+    # Positional
+    if len(args) >= 1 and bucket_name is None:
+        bucket_name = args[0]
+    if len(args) >= 2 and ("prefix" not in kwargs):
+        prefix = args[1]
+    if len(args) >= 3 and ("delimiter" not in kwargs):
+        delimiter = args[2]
+
+    # Back-compat: se não veio bucket, pegue do .env
+    if bucket_name is None:
+        bucket_name = load_config().gcs_bucket
+
+    if prefix is None:
+        prefix = ""
+
+    # Validação leve
+    if not bucket_name or "/" in bucket_name or str(bucket_name).startswith("gs://"):
+        raise ValueError("Bucket inválido. Use apenas o nome do bucket (sem 'gs://').")
+
+    return bucket_name, prefix, delimiter
+
+def list_objects(*args, **kwargs) -> List[str]:
+    """
+    Lista nomes (paths) de objetos sob `gs://{bucket}/{prefix}...`.
+    Compat:
+      - list_objects(bucket_name, prefix, delimiter=None)
+      - list_objects(prefix="raw/")  -> usa bucket do .env
+    """
+    bucket_name, prefix, delimiter = _resolve_bucket_and_prefix(args, kwargs)
+
+    def _op():
+        client = _get_storage_client()
+        blobs_iter = client.list_blobs(bucket_name, prefix=prefix, delimiter=delimiter)
+        return [b.name for b in blobs_iter]
+
+    return _with_simple_retry(_op, op_name=f"listar objetos em '{prefix}'")
+
+def iter_objects(*args, **kwargs) -> Iterable[str]:
+    """
+    Itera nomes (paths) de objetos.
+    Compat:
+      - iter_objects(bucket_name, prefix, delimiter=None)
+      - iter_objects(prefix="raw/")  -> usa bucket do .env
+    """
+    bucket_name, prefix, delimiter = _resolve_bucket_and_prefix(args, kwargs)
+    client = _get_storage_client()
+    for b in client.list_blobs(bucket_name, prefix=prefix, delimiter=delimiter):
+        yield b.name
+
+
 # =============================
-# 5) PEQUENO "SMOKE TEST" REAL
+# 6) PEQUENO "SMOKE TEST" REAL
 # =============================
 
 if __name__ == "__main__":
-    
     print("✅ Teste REAL no GCS usando .env")
     cfg = load_config()
     bucket = cfg.gcs_bucket

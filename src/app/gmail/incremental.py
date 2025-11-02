@@ -1,58 +1,46 @@
 # src/app/gmail/incremental.py
-"""
-incremental.py — Coleta incremental do Gmail por janela de datas e salva em GCS.
-
-Fluxo:
-  - Constrói o serviço Gmail (OAuth local; token em .tokens/)
-  - Lista mensagens por janela (after/before) e label por NOME via query (ex.: label:"QUOTES")
-  - Pula message_ids já processados (state/processed_messages.json no GCS)
-  - Baixa mensagem (formato 'full') e salva em raw/<threadId>/<messageId>.json
-  - Marca message_id como processado
-
-Observação: não usamos ainda a History API; usamos janela por data + filtro local.
-"""
-
 from __future__ import annotations
 
 import os
-from datetime import datetime, date, timedelta
-from typing import Iterable, Optional, Dict, Any, List
+import json
+from datetime import date, timedelta
+from typing import Optional, Dict, Any, Iterable, List
 
-from dateutil.parser import parse as dtparse
+from dotenv import load_dotenv
+load_dotenv()
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.auth.transport.requests import Request
 
-from app.core.config import load_config
-from app.core.state import ensure_state_initialized, has_processed, add_processed
-from app.core.io_gcs import save_json_to_gcs, object_exists_in_gcs
+from app.core.config import get_settings
+from app.core import io_gcs
+from app.core import state as state_store
 
-# ----- Constantes e helpers de ambiente -----
-
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+# ----------------------------------
+# Config / Env
+# ----------------------------------
+SCOPES_READONLY = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 GMAIL_CLIENT_SECRETS = os.getenv("GMAIL_CLIENT_SECRETS", "credentials/real-credentials-parrots-gmail.json")
-GMAIL_TOKEN_FILE = os.getenv("GMAIL_TOKEN_FILE", ".tokens/gmail_token.json")
+GMAIL_TOKEN_FILE = os.getenv("GMAIL_TOKEN_FILE", "tokens/gmail_token.json")
 GMAIL_USER = os.getenv("GMAIL_USER", "me")
-GMAIL_LABEL_DEFAULT = os.getenv("GMAIL_LABEL", "QUOTES")  # usado como label:"QUOTES" na query
 
 
-def _ensure_token_dir(path: str) -> None:
+# ----------------------------------
+# Gmail Auth
+# ----------------------------------
+def _ensure_dir_for(path: str) -> None:
     d = os.path.dirname(path)
     if d and not os.path.exists(d):
         os.makedirs(d, exist_ok=True)
 
-
-def build_gmail_service() -> Any:
-    """
-    Autentica via OAuth local. Na 1ª execução abre o navegador; depois reutiliza o token.
-    """
+def _build_service_readonly():
     creds = None
     if os.path.exists(GMAIL_TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(GMAIL_TOKEN_FILE, SCOPES)
+        creds = Credentials.from_authorized_user_file(GMAIL_TOKEN_FILE, SCOPES_READONLY)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -61,8 +49,8 @@ def build_gmail_service() -> Any:
             except Exception:
                 creds = None
         if not creds:
-            _ensure_token_dir(GMAIL_TOKEN_FILE)
-            flow = InstalledAppFlow.from_client_secrets_file(GMAIL_CLIENT_SECRETS, SCOPES)
+            _ensure_dir_for(GMAIL_TOKEN_FILE)
+            flow = InstalledAppFlow.from_client_secrets_file(GMAIL_CLIENT_SECRETS, SCOPES_READONLY)
             creds = flow.run_local_server(port=0)
             with open(GMAIL_TOKEN_FILE, "w") as f:
                 f.write(creds.to_json())
@@ -70,177 +58,221 @@ def build_gmail_service() -> Any:
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
-# ----- Query helpers -----
+# ----------------------------------
+# Query helpers
+# ----------------------------------
+def _ymd(d: str) -> str:
+    # Gmail aceita YYYY/MM/DD
+    return d.replace("-", "/")
 
-def _to_ymd(d: date | datetime | str) -> str:
-    if isinstance(d, str):
-        d = dtparse(d).date()
-    elif isinstance(d, datetime):
-        d = d.date()
-    return d.strftime("%Y/%m/%d")
-
-
-def build_gmail_query(
-    date_from: date | datetime | str,
-    date_to: date | datetime | str,
-    label_name: str = "",
-    extra: str = "",
-) -> str:
-    """
-    after/before com YYYY/MM/DD e label por NOME (label:"NOME").
-    before é exclusivo (before:2025/10/30 abrange até 2025-10-29).
-    """
-    a = _to_ymd(date_from)
-    b = _to_ymd(date_to)
-    parts = [f"after:{a}", f"before:{b}"]
-    if label_name:
-        parts.append(f'label:"{label_name}"')
-    if extra:
-        parts.append(extra)
-    return " ".join(parts)
+def _build_query(after: Optional[str], before: Optional[str], label: Optional[str]) -> str:
+    parts: List[str] = []
+    if label:
+        parts.append(f'label:"{label}"')
+    if after:
+        parts.append(f"after:{_ymd(after)}")
+    if before:
+        parts.append(f"before:{_ymd(before)}")
+    parts += ["-in:spam", "-in:trash"]
+    return " ".join(parts) if parts else ""
 
 
-# ----- Listagem + download -----
-
-def iter_message_ids(service, user_id: str, q: str, max_pages: int = 50) -> Iterable[str]:
-    """
-    Itera messageIds que satisfazem a query (paginação a 100 itens).
-    """
+# ----------------------------------
+# Gmail fetchers
+# ----------------------------------
+def _list_thread_ids(service, q: str, max_pages: int = 100) -> List[str]:
+    out: List[str] = []
     page_token = None
     pages = 0
     while True:
-        try:
-            req = service.users().messages().list(
-                userId=user_id,
-                q=q,
-                pageToken=page_token,
-                maxResults=100,
-            )
-            resp = req.execute()
-        except HttpError as e:
-            raise RuntimeError(f"Erro ao listar mensagens: {e}")
-
-        for item in resp.get("messages", []):
-            yield item["id"]
-
+        resp = service.users().threads().list(
+            userId=GMAIL_USER, q=q, pageToken=page_token, maxResults=200
+        ).execute()
+        out.extend([t["id"] for t in resp.get("threads", [])])
         page_token = resp.get("nextPageToken")
         pages += 1
         if not page_token or pages >= max_pages:
             break
+    return out
 
+def _get_thread_full(service, thread_id: str) -> Dict[str, Any]:
+    return service.users().threads().get(userId=GMAIL_USER, id=thread_id, format="full").execute()
 
-def get_message_full(service, user_id: str, message_id: str) -> Dict[str, Any]:
+def _iter_messages_full(query: str) -> Iterable[Dict[str, Any]]:
     """
-    Busca o conteúdo 'full' (com payload/parts).
+    Itera mensagens 'full' (dicts contendo 'id', 'threadId', 'payload', etc.)
+    respeitando a consulta Gmail `query`.
     """
-    try:
-        return service.users().messages().get(userId=user_id, id=message_id, format="full").execute()
-    except HttpError as e:
-        raise RuntimeError(f"Erro ao obter mensagem {message_id}: {e}")
+    service = _build_service_readonly()
+    thread_ids = _list_thread_ids(service, query)
+    for th_id in thread_ids:
+        try:
+            thread_full = _get_thread_full(service, th_id)
+        except HttpError:
+            continue
+        for msg in thread_full.get("messages", []):
+            # cada `msg` já é o raw completo desta mensagem
+            yield msg
 
 
-def raw_path(thread_id: str, message_id: str) -> str:
+# ----------------------------------
+# GCS helpers (compat com seus helpers)
+# ----------------------------------
+def _raw_gcs_path(thread_id: str, message_id: str) -> str:
+    """
+    Tenta usar seus helpers; se não existirem, cai no padrão raw/<thread>/<msg>.json
+    """
+    # build_raw_path(...)
+    if hasattr(io_gcs, "build_raw_path"):
+        return io_gcs.build_raw_path(thread_id=thread_id, message_id=message_id)
+    # path_raw_message(...)
+    if hasattr(io_gcs, "path_raw_message"):
+        return io_gcs.path_raw_message(thread_id, message_id)  # type: ignore[attr-defined]
+    # fallback
     return f"raw/{thread_id}/{message_id}.json"
 
+def _gcs_exists(bucket: str, path: str) -> bool:
+    if hasattr(io_gcs, "exists"):
+        return io_gcs.exists(path)  # type: ignore[attr-defined]
+    if hasattr(io_gcs, "object_exists_in_gcs"):
+        return io_gcs.object_exists_in_gcs(bucket, path)  # type: ignore[attr-defined]
+    raise RuntimeError("Nenhum helper de existência no GCS encontrado em io_gcs.")
 
-def fetch_window_and_dump(
-    bucket: str,
-    date_from: date | datetime | str,
-    date_to: date | datetime | str,
-    label: str = GMAIL_LABEL_DEFAULT,
-    extra_query: str = "",
-    max_pages: int = 20,
-    hard_limit: Optional[int] = None,
-) -> dict:
-    """
-    Executa a coleta na janela, salva no GCS e retorna um resumo.
-    Regras:
-      - Pula IDs já processados (state).
-      - Pula se objeto raw/<threadId>/<messageId>.json já existir no GCS.
-      - Respeita hard_limit para smoke tests.
-    """
-    ensure_state_initialized(bucket)
-    service = build_gmail_service()
-
-    q = build_gmail_query(date_from, date_to, label_name=label, extra=extra_query)
-
-    seen = 0
-    skipped = 0
-    skipped_exists = 0
-    saved = 0
-    errors = 0
-
-    for mid in iter_message_ids(service, GMAIL_USER, q=q, max_pages=max_pages):
-        if hard_limit and saved >= hard_limit:
-            break
-
+def _gcs_save_json(bucket: str, path: str, obj: Dict[str, Any]) -> None:
+    if hasattr(io_gcs, "save_json_to_gcs"):
+        # assinatura save_json_to_gcs(bucket, path, data)
         try:
-            if has_processed(bucket, mid):
-                skipped += 1
-                continue
+            io_gcs.save_json_to_gcs(bucket, path, obj)  # type: ignore[attr-defined]
+            return
+        except TypeError:
+            pass
+    # alguns projetos expõem save_json_to_gcs(path, data) sem bucket
+    if hasattr(io_gcs, "save_json_to_gcs"):
+        io_gcs.save_json_to_gcs(path, obj)  # type: ignore[misc]
+        return
+    raise RuntimeError("Nenhum helper de gravação JSON no GCS encontrado em io_gcs.")
 
-            msg = get_message_full(service, GMAIL_USER, mid)
 
-            # IDs SEMPRE vindos do Gmail:
-            thread_id = msg.get("threadId")
-            msg_id = msg.get("id")
-            if not thread_id or not msg_id:
-                raise RuntimeError(f"Mensagem sem threadId/id. mid={mid}")
+# ----------------------------------
+# Execução principal
+# ----------------------------------
+def run(
+    after: Optional[str] = None,
+    before: Optional[str] = None,
+    label: Optional[str] = None,
+) -> Dict[str, int]:
+    """
+    Executa a coleta incremental (janela after/before + label).
+    Salva raw/<threadId>/<messageId>.json no GCS e atualiza estado.
 
-            # Idempotência adicional: se já existir o RAW, pula sem baixar de novo
-            dest = raw_path(thread_id, msg_id)
-            if object_exists_in_gcs(bucket, dest):
-                # ainda assim marca como processado, para não insistir em janelas futuras
-                add_processed(bucket, msg_id)
-                skipped_exists += 1
-                continue
+    Returns:
+        {
+          'seen': X,
+          'saved': Y,
+          'skipped_already_processed': A,
+          'skipped_existing_raw': B,
+          'errors': E
+        }
+    """
+    settings = get_settings()
+    bucket = settings.gcs_bucket
+    label = label or settings.gmail_label
 
-            # Salva o JSON bruto e marca processado
-            save_json_to_gcs(bucket, dest, msg)
-            add_processed(bucket, msg_id)
+    # garante arquivos de estado (idempotente)
+    try:
+        state_store.ensure_state_initialized(bucket)
+    except Exception:
+        # não bloqueia o resto; segue com defaults
+        pass
 
-            print(f"✓ SAVED: {dest}")
-            saved += 1
-        except Exception as e:
-            print(f"✗ ERROR mid={mid}: {e}")
+    query = _build_query(after=after, before=before, label=label)
+
+    # estado em memória (set de ids já processados)
+    try:
+        processed = set(state_store.load_processed_messages(bucket))
+    except Exception:
+        processed = set()
+
+    seen = saved = skipped_proc = skipped_raw = errors = 0
+
+    for msg in _iter_messages_full(query=query):
+        seen += 1
+        message_id = msg.get("id")
+        thread_id = msg.get("threadId")
+        if not message_id or not thread_id:
             errors += 1
-        finally:
-            seen += 1
+            continue
 
-    return {
-        "query": q,
-        "label": label,
+        # 1) já processado?
+        if message_id in processed:
+            skipped_proc += 1
+            continue
+
+        # 2) já existe RAW no bucket?
+        raw_path = _raw_gcs_path(thread_id, message_id)
+        try:
+            if _gcs_exists(bucket, raw_path):
+                skipped_raw += 1
+                processed.add(message_id)  # marca para evitar rechecagens
+                continue
+        except Exception:
+            errors += 1
+            continue
+
+        # 3) salvar RAW
+        try:
+            _gcs_save_json(bucket, raw_path, msg)
+            saved += 1
+            processed.add(message_id)
+        except Exception:
+            errors += 1
+            continue
+
+    # persistir estado atualizado (melhor esforço)
+    try:
+        state_store.save_processed_messages(processed, bucket=bucket)
+    except Exception:
+        errors += 1
+
+    summary = {
         "seen": seen,
         "saved": saved,
-        "skipped_already_processed": skipped,
-        "skipped_existing_raw": skipped_exists,
+        "skipped_already_processed": skipped_proc,
+        "skipped_existing_raw": skipped_raw,
         "errors": errors,
     }
+    print(json.dumps(summary, ensure_ascii=False))
+    return summary
 
 
-# ---- CLI rápido (opcional) ----
+# ------------------ CLI ------------------
+def _parse_range_shortcut(range_expr: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """
+    Suporta --range newer_than:7d → (after, before).
+    """
+    if not range_expr:
+        return None, None
+    if range_expr.startswith("newer_than:") and range_expr.endswith("d"):
+        days = int(range_expr.split(":")[1][:-1])
+        before = date.today().isoformat()
+        after = (date.today() - timedelta(days=days)).isoformat()
+        return after, before
+    return None, None
+
+def parse_args():
+    import argparse
+    p = argparse.ArgumentParser(description="Coleta incremental do Gmail → GCS (raw/)")
+    p.add_argument("--after", help="YYYY-MM-DD")
+    p.add_argument("--before", help="YYYY-MM-DD")
+    p.add_argument("--label", help='label do Gmail (default: settings.gmail_label)')
+    p.add_argument("--range", help='atalho: ex. newer_than:7d')
+    return p.parse_args()
 
 if __name__ == "__main__":
-    from argparse import ArgumentParser
-
-    cfg = load_config()
-    bucket = cfg.gcs_bucket
-
-    ap = ArgumentParser(description="Coleta incremental do Gmail (janela por data).")
-    ap.add_argument("--from", dest="date_from", required=False, default=(date.today() - timedelta(days=3)).isoformat(), help="Data inicial (YYYY-MM-DD).")
-    ap.add_argument("--to", dest="date_to", required=False, default=(date.today() + timedelta(days=1)).isoformat(), help="Data final exclusiva (YYYY-MM-DD).")
-    ap.add_argument("--label", dest="label", required=False, default=GMAIL_LABEL_DEFAULT, help='Nome da label (ex.: QUOTES). Será usado como label:"NOME" na query.')
-    ap.add_argument("--extra", dest="extra", required=False, default="", help='Query extra (ex.: \'subject:"cotação" -category:promotions\').')
-    ap.add_argument("--limit", dest="limit", type=int, required=False, default=10, help="Hard limit de mensagens para salvar.")
-    args = ap.parse_args()
-
-    summary = fetch_window_and_dump(
-        bucket=bucket,
-        date_from=args.date_from,
-        date_to=args.date_to,
-        label=args.label,
-        extra_query=args.extra,
-        max_pages=20,
-        hard_limit=args.limit,
-    )
-    print(summary)
+    args = parse_args()
+    after, before = args.after, args.before
+    if args.range and not (after or before):
+        _a, _b = _parse_range_shortcut(args.range)
+        after = after or _a
+        before = before or _b
+    run(after=after, before=before, label=args.label)

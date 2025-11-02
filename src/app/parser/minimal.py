@@ -1,224 +1,208 @@
 # src/app/parser/minimal.py
 from __future__ import annotations
-
-import base64
-import hashlib
-import html
+import argparse
 import json
 import re
-from typing import Dict, Any, Optional, Tuple, List
+import hashlib
+from html import unescape
+from typing import Dict, Any, Iterable, Optional, Tuple
 
-from google.cloud import storage
+from app.core.config import get_settings
+from app.core import io_gcs
 
-from app.core import io_gcs  # save_json_to_gcs, load_json_from_gcs, object_exists_in_gcs
-try:
-    from app.core import state  # opcional
-except Exception:
-    state = None
+# ------------------------ Utilidades de parsing --------------------------------
 
+_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"[ \t]+")
+_NL_RE = re.compile(r"\s*\n\s*")
 
-# -----------------------------
-# Helpers de extração de texto
-# -----------------------------
-def _b64url_decode(data: str) -> bytes:
-    if not data:
-        return b""
-    padding = '=' * (-len(data) % 4)
-    return base64.urlsafe_b64decode(data + padding)
+def _sha1short(text: str, length: int = 8) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:length]
 
-def _strip_html(html_text: str) -> str:
-    no_scripts = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", html_text or "")
-    text = re.sub(r"(?s)<[^>]+>", " ", no_scripts)
-    text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
+def _html_to_text(html: str) -> str:
+    if not isinstance(html, str):
+        return ""
+    # remove scripts/styles
+    html = re.sub(r"(?is)<(script|style)\b[^>]*>.*?</\1>", "", html)
+    # remove tags
+    txt = _TAG_RE.sub("", html)
+    # unescape entidades
+    txt = unescape(txt)
+    # normaliza espaços/linhas
+    txt = _WS_RE.sub(" ", txt)
+    txt = _NL_RE.sub("\n", txt).strip()
+    return txt
 
-def _walk_parts_for_mime(part: Dict[str, Any], wanted: str) -> Optional[str]:
-    if not part:
+def _normalize_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = _NL_RE.sub("\n", text)
+    text = text.strip()
+    return text
+
+def _extract_plain_text_from_gmail_payload(msg: Dict[str, Any]) -> str:
+    """
+    Extrai texto priorizando 'text/plain'. Se não houver, tenta 'text/html' e faz strip.
+    Espera-se um RAW no formato do Gmail (payload/parts/body.data etc.).
+    """
+    payload = msg.get("payload", {}) or msg.get("Payload", {})  # tolerante a variações
+    mimeType = payload.get("mimeType", "")
+
+    def _decode_data(data_b64url: Optional[str]) -> str:
+        if not data_b64url:
+            return ""
+        import base64
+        try:
+            return base64.urlsafe_b64decode(data_b64url + "==").decode("utf-8", errors="replace")
+        except Exception:
+            pad = "=" * ((4 - len(data_b64url) % 4) % 4)
+            return base64.urlsafe_b64decode((data_b64url + pad).encode("utf-8")).decode("utf-8", errors="replace")
+
+    def _walk_parts(part: Dict[str, Any]) -> Iterable[Tuple[str, str]]:
+        mt = part.get("mimeType", "")
+        body = part.get("body", {}) or {}
+        data = body.get("data")
+        if data:
+            yield (mt, _decode_data(data))
+        for sub in part.get("parts", []) or []:
+            yield from _walk_parts(sub)
+
+    # Caso simples: sem parts (mensagem simples)
+    if mimeType and not payload.get("parts"):
+        body = payload.get("body", {}) or {}
+        data = body.get("data")
+        text = _decode_data(data) if data else ""
+        if mimeType.startswith("text/plain"):
+            return _normalize_text(text)
+        if mimeType.startswith("text/html"):
+            return _normalize_text(_html_to_text(text))
+
+    # Caso multipart: percorre parts
+    plain_candidates = []
+    html_candidates = []
+    for mt, content in _walk_parts(payload):
+        if mt.startswith("text/plain") and content:
+            plain_candidates.append(content)
+        elif mt.startswith("text/html") and content:
+            html_candidates.append(content)
+
+    if plain_candidates:
+        return _normalize_text("\n".join(plain_candidates))
+    if html_candidates:
+        html_join = "\n".join(html_candidates)
+        return _normalize_text(_html_to_text(html_join))
+
+    # Fallback: snippet
+    snippet = msg.get("snippet", "")
+    return _normalize_text(snippet)
+
+# ------------------------ Caminhos GCS -----------------------------------------
+
+def _parsed_gcs_path(thread_id: str, message_id: str, sha1: str) -> str:
+    return f"parsed/{thread_id}/{message_id}__{sha1}.json"
+
+def _iter_raw_objects() -> Iterable[str]:
+    """
+    Itera caminhos 'raw/<threadId>/<messageId>.json' no GCS.
+    """
+    yield from io_gcs.list_objects(prefix="raw/")
+
+# ------------------------ Núcleo do parser -------------------------------------
+
+def _parse_one_raw(raw_path: str) -> Optional[Dict[str, Any]]:
+    """
+    Carrega um RAW e retorna o dicionário pronto para salvar em parsed/.
+    Retorna None se não conseguir extrair um texto útil.
+    """
+    try:
+        raw = io_gcs.load_json_from_gcs(raw_path)
+    except Exception:
         return None
-    mime = part.get("mimeType") or part.get("mimetype")
-    body = part.get("body", {})
-    data = body.get("data")
-    parts = part.get("parts") or []
 
-    if mime == wanted and data:
+    message_id = raw.get("id") or raw.get("messageId")
+    thread_id  = raw.get("threadId") or raw.get("thread_id")
+    if not message_id or not thread_id:
+        return None
+
+    # Headers úteis para a etapa LLM (salvamos já no parsed/)
+    payload = raw.get("payload", {}) or {}
+    headers_list = payload.get("headers", []) or []
+    headers = { (h.get("name") or "").lower(): (h.get("value") or "") for h in headers_list }
+
+    email_from = headers.get("from", "") or raw.get("From", "")
+    subject    = headers.get("subject", "") or raw.get("Subject", "")
+    date_hdr   = headers.get("date", "") or raw.get("Date", "")
+
+    text = _extract_plain_text_from_gmail_payload(raw) or ""
+    if not text.strip():
+        return None
+
+    sha1 = _sha1short(text)
+    parsed = {
+        "threadId": thread_id,
+        "messageId": message_id,
+        "sha1": sha1,
+        "plain_text": text,
+        "size": len(text),
+        # Headers que ajudarão o LLM na normalização
+        "header_from": email_from,
+        "header_subject": subject,
+        "header_date": date_hdr,
+    }
+    return parsed
+
+def run() -> Dict[str, int]:
+    """
+    Varre GCS 'raw/' e cria 'parsed/<threadId>/<messageId>__<sha1>.json'.
+    Idempotente: se parsed existir, pula.
+    Retorna e imprime: {'seen', 'parsed', 'skipped', 'errors'}.
+    """
+    _ = get_settings()  # mantém compatível se você usa env aqui
+
+    seen = parsed = skipped = errors = 0
+
+    for raw_path in _iter_raw_objects():
+        seen += 1
         try:
-            return _b64url_decode(data).decode(errors="replace")
-        except Exception:
-            return None
-
-    if wanted.startswith("text/") and data and not parts and isinstance(data, str) and mime and mime.startswith("text/"):
-        try:
-            return _b64url_decode(data).decode(errors="replace")
-        except Exception:
-            pass
-
-    for p in parts:
-        got = _walk_parts_for_mime(p, wanted)
-        if got:
-            return got
-    return None
-
-def extract_plain_text_from_payload(payload: Dict[str, Any]) -> Tuple[str, str]:
-    if not payload:
-        return ("", "empty")
-
-    txt = _walk_parts_for_mime(payload, "text/plain")
-    if isinstance(txt, str) and txt.strip():
-        return (txt.strip(), "text/plain")
-
-    html_text = _walk_parts_for_mime(payload, "text/html")
-    if isinstance(html_text, str) and html_text.strip():
-        return (_strip_html(html_text), "text/html")
-
-    body = payload.get("body", {})
-    data = body.get("data")
-    if isinstance(data, str) and data.strip():
-        raw = _b64url_decode(data).decode(errors="replace")
-        mime = payload.get("mimeType") or payload.get("mimetype") or ""
-        if isinstance(raw, str) and raw.strip():
-            if str(mime).lower().startswith("text/html"):
-                return (_strip_html(raw), "text/html")
-            return (raw.strip(), "text/plain")
-
-    return ("", "empty")
-
-def sha1short(text: str, length: int = 8) -> str:
-    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:length]
-
-def _headers_to_dict(payload: Dict[str, Any]) -> Dict[str, str]:
-    hdrs = {}
-    for h in (payload or {}).get("headers", []):
-        name = h.get("name")
-        value = h.get("value")
-        if name:
-            hdrs[name.lower()] = value or ""
-    return hdrs
-
-
-# -----------------------------
-# Listagem de objetos raw/ no GCS
-# -----------------------------
-def _list_objects(bucket: str, prefix: str) -> List[str]:
-    client = storage.Client()
-    bkt = client.bucket(bucket)
-    # Usamos list_blobs; retornar nomes (blob.name)
-    return [blob.name for blob in client.list_blobs(bkt, prefix=prefix)]
-
-
-# -----------------------------
-# Núcleo do PASSO 5 (Parser)
-# -----------------------------
-def parse_raw_to_parsed(bucket: str, limit: int | None = None) -> Dict[str, int]:
-    summary = {"seen": 0, "parsed": 0, "skipped": 0, "errors": 0}
-
-    # lista todos os objetos sob raw/
-    raw_keys: List[str] = _list_objects(bucket, prefix="raw/")
-    # filtra só arquivos .json de mensagem (raw/<threadId>/<messageId>.json)
-    raw_keys = [k for k in raw_keys if k.endswith(".json") and k.count("/") >= 2]
-
-    if isinstance(limit, int) and limit > 0:
-        raw_keys = raw_keys[:limit]
-
-    for raw_key in raw_keys:
-        summary["seen"] += 1
-        try:
-            parts = raw_key.split("/")
-            thread_id = parts[1] if len(parts) >= 3 else ""
-            message_file = parts[2] if len(parts) >= 3 else ""
-            message_id = message_file.replace(".json", "")
-
-            # (opcional) idempotência por state
-            if state and hasattr(state, "is_message_processed"):
-                try:
-                    if state.is_message_processed(bucket=bucket, message_id=message_id):
-                        print(f"→ SKIP (state): {message_id}")
-                        summary["skipped"] += 1
-                        continue
-                except Exception:
-                    pass
-
-            raw_obj = io_gcs.load_json_from_gcs(bucket, raw_key)
-            if not isinstance(raw_obj, dict):
-                raise ValueError("Objeto raw não é um dict JSON.")
-
-            msg_id = raw_obj.get("id") or message_id
-            th_id = raw_obj.get("threadId") or thread_id
-            snippet = raw_obj.get("snippet") or ""
-
-            payload = raw_obj.get("payload") or {}
-            headers = _headers_to_dict(payload)
-
-            date = headers.get("date", "")
-            subject = headers.get("subject", "")
-            from_ = headers.get("from", "")
-            to_ = headers.get("to", "")
-
-            plain_text, source = extract_plain_text_from_payload(payload)
-            if not plain_text.strip() and snippet:
-                plain_text = snippet.strip()
-                source = "snippet"
-
-            hshort = sha1short(plain_text)
-            parsed_key = f"parsed/{th_id}/{msg_id}__{hshort}.json"
-
-            # idempotência por existência do arquivo de saída
-            if io_gcs.object_exists_in_gcs(bucket, parsed_key):
-                print(f"→ SKIP (exists): {parsed_key}")
-                summary["skipped"] += 1
-                if state and hasattr(state, "mark_message_processed"):
-                    try:
-                        state.mark_message_processed(bucket=bucket, message_id=msg_id)
-                    except Exception:
-                        pass
+            raw_name = raw_path.split("/", 2)[-1]  # threadId/messageId.json
+            parts = raw_name.split("/")
+            if len(parts) != 2 or not parts[1].endswith(".json"):
+                skipped += 1
                 continue
 
-            out = {
-                "message_id": msg_id,
-                "thread_id": th_id,
-                "date": date,
-                "from": from_,
-                "to": to_,
-                "subject": subject,
-                "snippet": snippet,
-                "plain_text": plain_text,
-                "_text_source": source,
-                "_raw_object_path": raw_key,
-                "_parsed_key": parsed_key,
-                "_sha1short": hshort,
-            }
+            thread_id = parts[0]
+            message_id = parts[1][:-5]  # remove ".json"
 
-            io_gcs.save_json_to_gcs(bucket, parsed_key, out)
-            print(f"✓ PARSED: {parsed_key}")
-            summary["parsed"] += 1
+            parsed_doc = _parse_one_raw(raw_path)
+            if not parsed_doc:
+                skipped += 1
+                continue
 
-            if state and hasattr(state, "mark_message_processed"):
-                try:
-                    state.mark_message_processed(bucket=bucket, message_id=msg_id)
-                except Exception:
-                    pass
+            sha1 = parsed_doc["sha1"]
+            out_path = _parsed_gcs_path(thread_id, message_id, sha1)
 
-        except FileNotFoundError as e:
-            print(f"✗ ERROR (not found) {raw_key}: {e}")
-            summary["errors"] += 1
-        except KeyError as e:
-            print(f"✗ ERROR (missing key) {raw_key}: {e}")
-            summary["errors"] += 1
-        except ValueError as e:
-            print(f"✗ ERROR (value) {raw_key}: {e}")
-            summary["errors"] += 1
-        except Exception as e:
-            try:
-                ctx = {"raw_key": raw_key, "err": str(e)}
-                print(f"✗ ERROR (unexpected) {json.dumps(ctx, ensure_ascii=False)}")
-            except Exception:
-                print(f"✗ ERROR (unexpected) {raw_key}: {e}")
-            summary["errors"] += 1
+            if io_gcs.exists(out_path):
+                skipped += 1
+                continue
 
+            io_gcs.save_json_to_gcs(out_path, parsed_doc)
+            parsed += 1
+
+        except Exception:
+            errors += 1
+            continue
+
+    summary = {"seen": seen, "parsed": parsed, "skipped": skipped, "errors": errors}
+    print(json.dumps(summary, ensure_ascii=False))
     return summary
 
+# ------------------------ CLI --------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Parser mínimo: raw/ → parsed/")
+    return p.parse_args()
 
 if __name__ == "__main__":
-    from app.core.config import get_settings
-    bucket = get_settings().gcs_bucket
-    s = parse_raw_to_parsed(bucket=bucket, limit=None)
-    print(json.dumps(s, ensure_ascii=False, indent=2))
+    parse_args()
+    run()

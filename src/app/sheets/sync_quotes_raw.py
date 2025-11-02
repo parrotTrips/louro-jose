@@ -3,21 +3,23 @@ from __future__ import annotations
 
 import io
 import json
-from typing import Dict, Any, List, Tuple, Set
+from typing import Dict, List, Iterable
 
-import os
-from google.cloud import storage
-from google.oauth2.service_account import Credentials as SACredentials
+import google.auth
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+from google.auth.transport.requests import Request
 
-from app.core.io_gcs import load_json_from_gcs
 from app.core.config import get_settings
+from app.core import io_gcs
 
-# =========================================
-# Cabeçalho de negócio (visível no Sheets)
-# =========================================
-HEADERS_VISIBLE = [
+# ============================================================
+# Cabeçalho oficial (17 colunas) + coluna técnica `_key`
+# (precisa ser IGUAL ao header que você escreveu na aba)
+# ============================================================
+
+SHEET_TAB = "quotes_raw"
+
+FULL_HEADER: List[str] = [
     "Timestamp",
     "Fornecedor",
     "Assunto",
@@ -35,287 +37,170 @@ HEADERS_VISIBLE = [
     "Serviços incluso? Explicação: existem hotéis que consideram a tarifa de serviço já incluso e outros não.",
     "Política de pagamento",
     "Política de cancelamento",
+    "_key",
 ]
 
-# Coluna técnica para idempotência (pode ocultar no Sheets)
-TECH_KEY_COL = "_key"
+# Aliases de campos que vêm do normalizador
+FIELD_ALIASES: Dict[str, str] = {
+    "_source_subject": "Assunto",
+}
 
-# Cabeçalho real no Sheets = visível + técnica
-SHEET_HEADERS = HEADERS_VISIBLE + [TECH_KEY_COL]
+# ============================================================
+# Google Sheets client (usa ADC / service account do env)
+# ============================================================
 
-# Caminho do dataset no GCS (JSONL deduplicado)
-TABLE_JSONL_PATH = "tables/quotes_raw.jsonl"
+def _build_sheets_client():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds, _ = google.auth.default(scopes=scopes)
+    if hasattr(creds, "expired") and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    return build("sheets", "v4", credentials=creds)
 
-SHEET_TAB_NAME = "quotes_raw"
-SHEETS_SA_JSON = os.getenv("SHEETS_SA_JSON", "credentials/sheets-parrots.json")
-
-
-# =========================================
-# GCS helpers
-# =========================================
-def _list_parsed_objects(bucket: str) -> List[str]:
-    client = storage.Client()
-    bkt = client.bucket(bucket)
-    return [b.name for b in client.list_blobs(bkt, prefix="parsed/") if b.name.endswith(".json")]
-
-def _load_parsed(bucket: str, blob_path: str) -> Dict[str, Any]:
-    return load_json_from_gcs(bucket, blob_path)
-
-def _rows_from_parsed(obj: Dict[str, Any]) -> Tuple[str, List[Any]]:
-    """
-    Constrói (key, row) para o Sheets a partir de um objeto parsed/.
-    - key = message_id__sha1short  (usada p/ idempotência)
-    - row segue a ordem de HEADERS_VISIBLE + [_key]
-    """
-    msg_id = obj.get("message_id", "")
-    hshort = obj.get("_sha1short", "")
-    key = f"{msg_id}__{hshort}"
-
-    # Mapeamento mínimo agora; os demais campos ficam vazios para o parser “rico” preencher no futuro
-    timestamp = obj.get("date", "")
-    fornecedor = obj.get("from", "")
-    assunto = obj.get("subject", "")
-    descricao_quartos = obj.get("plain_text", "")
-
-    row_visible = [
-        timestamp,               # Timestamp
-        fornecedor,              # Fornecedor
-        assunto,                 # Assunto
-        "",                      # Nome do hotel
-        "",                      # Cidade
-        "",                      # Check-in
-        "",                      # Check-out
-        "",                      # Número de quartos
-        descricao_quartos,       # Descrição dos Quartos (mínimo didático)
-        "",                      # Categoria do quarto
-        "",                      # Preço (num)
-        "",                      # Configuração do quarto
-        "",                      # Tarifa NET ou comissionada?
-        "",                      # Taxa? Ex.: 5% de ISS
-        "",                      # Serviços incluso? ...
-        "",                      # Política de pagamento
-        "",                      # Política de cancelamento
-    ]
-
-    row = row_visible + [key]
-    return key, row
-
-def _write_jsonl_dedup(bucket: str, rows: List[List[Any]]) -> int:
-    """Escreve JSONL deduplicado com base em _key."""
-    # Dedup por _key (última coluna)
-    seen: Set[str] = set()
-    out_dicts: List[Dict[str, Any]] = []
-    for r in rows:
-        k = str(r[-1])
-        if k in seen:
-            continue
-        seen.add(k)
-        # produzir dict com campos visíveis + _key
-        d = dict(zip(SHEET_HEADERS, r))
-        out_dicts.append(d)
-
-    client = storage.Client()
-    bkt = client.bucket(bucket)
-    blob = bkt.blob(TABLE_JSONL_PATH)
-
-    buf = io.StringIO()
-    for d in out_dicts:
-        buf.write(json.dumps(d, ensure_ascii=False))
-        buf.write("\n")
-    blob.upload_from_string(buf.getvalue(), content_type="application/jsonl; charset=utf-8")
-    return len(out_dicts)
-
-
-# =========================================
-# Sheets helpers
-# =========================================
-def _build_sheets_service():
-    """
-    Usa OAuth do usuário (InstalledAppFlow) com escopo de Sheets.
-    Salva token em .tokens/sheets_token.json
-    """
-    import os
-    from googleapiclient.discovery import build
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from google.oauth2.credentials import Credentials
-    from google.auth.transport.requests import Request
-
-    SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-    CLIENT_SECRETS = os.getenv("SHEETS_CLIENT_SECRETS", "credentials/real-credentials-parrots-gmail.json")
-    TOKEN_PATH = os.getenv("SHEETS_TOKEN_FILE", ".tokens/sheets_token.json")
-
-    creds = None
-    if os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS, SCOPES)
-            creds = flow.run_local_server(port=0)
-            with open(TOKEN_PATH, "w") as f:
-                f.write(creds.to_json())
-
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
-
-
-
-
-def _ensure_tab_and_headers(service, spreadsheet_id: str, tab_name: str, headers: List[str]) -> None:
-    sheets = service.spreadsheets()
-    meta = sheets.get(spreadsheetId=spreadsheet_id).execute()
-    sheet_id = None
-    for sh in meta.get("sheets", []):
-        title = sh.get("properties", {}).get("title")
-        if title == tab_name:
-            sheet_id = sh.get("properties", {}).get("sheetId")
-            break
-
-    if sheet_id is None:
-        requests = [{"addSheet": {"properties": {"title": tab_name, "gridProperties": {"frozenRowCount": 1}}}}]
-        sheets.batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
-        sheets.values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{tab_name}!A1",
-            valueInputOption="RAW",
-            body={"values": [headers]},
+def _ensure_tab_and_header(svc, sheet_id: str) -> None:
+    meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute()
+    tab_titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if SHEET_TAB not in tab_titles:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": SHEET_TAB}}}]},
         ).execute()
-    else:
-        resp = sheets.values().get(spreadsheetId=spreadsheet_id, range=f"{tab_name}!A1:ZZ1").execute()
-        v = resp.get("values", [])
-        if not v or not v[0]:
-            sheets.values().update(
-                spreadsheetId=spreadsheet_id,
-                range=f"{tab_name}!A1",
-                valueInputOption="RAW",
-                body={"values": [headers]},
-            ).execute()
 
-def _read_existing_keys(service, spreadsheet_id: str, tab_name: str) -> Set[str]:
-    """
-    Lê a coluna técnica _key (última coluna). Se a aba ainda não tiver _key,
-    volta conjunto vazio.
-    """
-    sheets = service.spreadsheets()
-    # Descobre quantas colunas existem (para localizar _key no final)
-    header = sheets.values().get(spreadsheetId=spreadsheet_id, range=f"{tab_name}!1:1").execute()
-    cols = header.get("values", [[]])[0]
-    if not cols:
-        return set()
-    key_col_idx = None
-    for i, name in enumerate(cols, start=1):
-        if name == TECH_KEY_COL:
-            key_col_idx = i
-            break
-    if key_col_idx is None:
-        # não há coluna _key ainda
-        return set()
-
-    col_letter = _number_to_column_letter(key_col_idx)
-    resp = sheets.values().get(
-        spreadsheetId=spreadsheet_id,
-        range=f"{tab_name}!{col_letter}2:{col_letter}",
-        majorDimension="COLUMNS",
+    # escreve/garante o header
+    end_col = chr(ord("A") + len(FULL_HEADER) - 1)
+    svc.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{SHEET_TAB}!A1:{end_col}1",
+        valueInputOption="RAW",
+        body={"values": [FULL_HEADER]},
     ).execute()
-    arr = resp.get("values", [])
-    if not arr:
-        return set()
-    return set(v for v in arr[0] if isinstance(v, str) and v.strip())
 
-def _append_rows(service, spreadsheet_id: str, tab_name: str, rows: List[List[Any]]) -> int:
+def _load_existing_keys_from_sheet(svc, sheet_id: str) -> set:
+    # lê a coluna _key a partir da linha 2
+    key_col_idx = FULL_HEADER.index("_key")  # zero-based
+    col_letter = chr(ord("A") + key_col_idx)
+    res = svc.spreadsheets().values().get(
+        spreadsheetId=sheet_id,
+        range=f"{SHEET_TAB}!{col_letter}2:{col_letter}",
+    ).execute()
+    values = res.get("values", [])
+    return {row[0] for row in values if row and row[0]}
+
+def _append_rows(svc, sheet_id: str, rows: List[List]) -> None:
     if not rows:
-        return 0
-    sheets = service.spreadsheets()
-    resp = sheets.values().append(
-        spreadsheetId=spreadsheet_id,
-        range=f"{tab_name}!A1",
+        return
+    svc.spreadsheets().values().append(
+        spreadsheetId=sheet_id,
+        range=f"{SHEET_TAB}!A1",
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": rows},
     ).execute()
-    return int(resp.get("updates", {}).get("updatedRows", 0))
 
-def _number_to_column_letter(n: int) -> str:
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
+# ============================================================
+# Carregar dados normalizados do GCS (parsed_fixed/)
+# ============================================================
 
-
-# =========================================
-# Função principal
-# =========================================
-def sync_quotes_raw(
-    bucket: str,
-    sheet_id: str,
-    tab_name: str = SHEET_TAB_NAME,
-    limit: int | None = None,
-) -> Dict[str, int]:
+def _iter_parsed_fixed(bucket: str) -> Iterable[Dict]:
     """
-    Sincroniza parsed/ → GCS(JSONL) + Sheets(aba quotes_raw).
-    - JSONL: deduplicado, sobrescrito (idempotente).
-    - Sheets: cria aba/cabeçalho se necessário; lê _key existentes; appenda só novas.
+    Itera por todos os arquivos parsed_fixed/*.json no GCS.
+    Cada arquivo é uma LISTA de registros (dicts).
     """
-    summary = {
-        "parsed_seen": 0,
-        "rows_built": 0,
-        "jsonl_records": 0,
-        "sheet_existing_keys": 0,
-        "sheet_appended": 0,
-        "sheet_skipped": 0,
-        "errors": 0,
-    }
-
-    # 1) Coleta parsed/
-    keys = _list_parsed_objects(bucket)
-    keys = [k for k in keys if k.endswith(".json")]
-    if isinstance(limit, int) and limit > 0:
-        keys = keys[:limit]
-    summary["parsed_seen"] = len(keys)
-
-    # 2) Constrói linhas
-    rows: List[List[Any]] = []
-    for blob_path in keys:
+    for name in io_gcs.iter_objects(bucket, "parsed_fixed/"):
+        if not name.endswith(".json"):
+            continue
         try:
-            obj = _load_parsed(bucket, blob_path)
-            _, row = _rows_from_parsed(obj)
-            rows.append(row)
-        except Exception:
-            summary["errors"] += 1
-    summary["rows_built"] = len(rows)
+            data = io_gcs.load_json_from_gcs(bucket, name)
+            if isinstance(data, list):
+                for rec in data:
+                    if isinstance(rec, dict):
+                        rec["_obj"] = name  # debug
+                        yield rec
+        except Exception as e:
+            yield {"_error": f"erro lendo {name}: {e}"}
 
-    # 3) Escreve JSONL deduplicado no GCS
-    summary["jsonl_records"] = _write_jsonl_dedup(bucket, rows)
+# ============================================================
+# Montagem das linhas conforme FULL_HEADER
+# ============================================================
 
-    # 4) Sheets
+def _row_from_record(rec: Dict) -> List:
+    # aplica aliases (ex.: _source_subject → Assunto)
+    for src, dst in FIELD_ALIASES.items():
+        if src in rec and dst not in rec:
+            rec[dst] = rec[src]
+
+    # monta a linha na ordem exata do FULL_HEADER; faltantes ficam ""
+    row = []
+    for col in FULL_HEADER:
+        row.append(rec.get(col, ""))
+    return row
+
+# ============================================================
+# run() — núcleo
+# ============================================================
+
+def run() -> Dict:
+    """
+    Lê todos os registros em parsed_fixed/*.json (GCS), normaliza colunas
+    para o FULL_HEADER, deduplica por `_key`, grava um snapshot JSON no GCS
+    e faz append apenas do que não está na planilha.
+    """
+    s = get_settings()
+    bucket = s.gcs_bucket
+    sheet_id = s.sheet_id
+
+    svc = _build_sheets_client()
+    _ensure_tab_and_header(svc, sheet_id)
+    existing_keys = _load_existing_keys_from_sheet(svc, sheet_id)
+
+    parsed_seen = 0
+    rows_built = 0
+    appended = 0
+    errors = 0
+    to_append: List[List] = []
+
+    # também manter um snapshot consolidado (JSON, não JSONL) no GCS
+    snapshot: List[Dict] = []
+
+    for rec in _iter_parsed_fixed(bucket):
+        if "_error" in rec:
+            errors += 1
+            continue
+        parsed_seen += 1
+
+        key = rec.get("_key")
+        if not key:
+            errors += 1
+            continue
+
+        # snapshot completo
+        snapshot.append(rec)
+
+        # se já está na planilha, pula
+        if key in existing_keys:
+            continue
+
+        row = _row_from_record(rec)
+        to_append.append(row)
+        rows_built += 1
+
+    # append em lote
+    _append_rows(svc, sheet_id, to_append)
+    appended = len(to_append)
+
+    # grava snapshot no GCS (JSON)
     try:
-        service = _build_sheets_service()
-        _ensure_tab_and_headers(service, sheet_id, tab_name, SHEET_HEADERS)
-        existing = _read_existing_keys(service, sheet_id, tab_name)
-        summary["sheet_existing_keys"] = len(existing)
+        io_gcs.save_json_to_gcs(bucket, "tables/quotes_raw.json", snapshot)
+    except Exception:
+        errors += 1
 
-        to_append = [r for r in rows if str(r[-1]) not in existing]
-        summary["sheet_skipped"] = len(rows) - len(to_append)
-
-        appended = _append_rows(service, sheet_id, tab_name, to_append)
-        summary["sheet_appended"] = appended
-    except HttpError as e:
-        print(f"✗ SHEETS ERROR: {e}")
-        summary["errors"] += 1
-
+    summary = {
+        "parsed_seen": parsed_seen,
+        "rows_built": rows_built,
+        "json_records": len(snapshot),
+        "sheet_existing_keys": len(existing_keys),
+        "sheet_appended": appended,
+        "sheet_skipped": parsed_seen - appended,
+        "errors": errors,
+    }
+    print(json.dumps(summary, ensure_ascii=False))
     return summary
-
-
-# Execução direta
-if __name__ == "__main__":
-    settings = get_settings()
-    s = sync_quotes_raw(
-        bucket=settings.gcs_bucket,
-        sheet_id=settings.sheet_id,
-        tab_name=SHEET_TAB_NAME,
-        limit=None,
-    )
-    print(json.dumps(s, ensure_ascii=False, indent=2))
