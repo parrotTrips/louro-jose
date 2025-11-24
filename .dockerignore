@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+.venv/
+env/
+.git
+.gitignore
+tokens/
+credentials/
+*.json
+*.csv
+*.parquet
+dist/
+build/
+.wheels/
