@@ -1,256 +1,602 @@
-Gmail Threads Dumper — Documentação do Projeto
+# Parrot Agents – Labeler + Storage (Gmail → GCS)
 
-==============================================
+Este repositório implementa a **primeira etapa** de um pipeline baseado em agentes para processar cotações de viagem recebidas por e-mail.
 
-Este repositório implementa um MVP simples e modular para:
-1. Autenticar no Gmail via OAuth;
-2. Listar rótulos (labels) da caixa de entrada (teste rápido);
-3. Buscar mensagens por rótulo e/ou consulta (--q), agrupar por thread e salvar 1 JSON por thread em raw_messages/.
-4. Extrair informações dessas mensagens com uma LLM e enquadrar nos campos do cabeçalho da aba quotes;
-5. Persistir os dados extraídos na planilha do Google Sheets indicada no .env.
+Neste estágio, temos **um agente principal**:
 
--------------------------------------------------------------------------------
-1) Estrutura de Pastas e Papéis de Cada Arquivo
--------------------------------------------------------------------------------
+> **LabelerStorageAgent**
+> 1. Usa um **LLM** para classificar emails como *VIAGEM* ou *NAO-VIAGEM*  
+> 2. Aplica o rótulo **`QUOTES`** no Gmail para emails de viagem  
+> 3. Lê todas as **threads** com `QUOTES`  
+> 4. Salva essas threads no **Google Cloud Storage (GCS)**  
+> 5. Mantém um **estado incremental** para não reprocessar a mesma thread sempre
 
-.
-├── credentials/
-│   └── real-credentials-parrots-gmail.json
-│      → Credenciais OAuth do Google obtidas no Google Cloud Console (Client ID/Secret).
-│        Este arquivo é usado apenas localmente para iniciar o fluxo de autorização.
-│
-├── raw_messages/
-│   → Pasta onde serão salvos os JSONs resultantes (um arquivo por thread do Gmail).
-│
-├── outputs/
-│   → (Novo) Artefatos das fases de extração e persistência:
-│      - quotes_extracted.jsonl  (saída da extração via LLM, 1 JSON por linha)
-│      - quotes_extracted.csv    (opcional, se decidir gerar CSV)
-│
-├── token_files/
-│   → Pasta onde ficará o token de acesso/refresh gerado após o primeiro login (OAuth).
-│     O arquivo padrão é `token_gmail_v1.json`. Se apagado, o login será solicitado novamente.
-│
-├── utils/
-│   ├── __init__.py
-│   │  → Arquivo vazio para tornar `utils` um pacote Python importável.
-│   │
-│   ├── mime.py
-│   │  → Funções utilitárias para lidar com MIME:
-│   │     - `get_header(...)`: obtém um header específico (ex.: From, To, Subject).
-│   │     - `extract_prefer_plaintext(...)`: extrai o corpo preferindo `text/plain`; se não existir,
-│   │       converte `text/html` em texto legível (remove scripts/styles e normaliza quebras de linha).
-│   │     - Helpers para decodificar Base64URL e percorrer partes MIME recursivamente.
-│   │
-│   ├── gmail_query.py
-│   │  → Funções para conversar com a Gmail API em alto nível:
-│   │     - `find_label_id(...)`: resolve o ID de um rótulo pelo nome (ex.: "QUOTES").
-│   │     - `list_messages(...)`: lista mensagens respeitando rótulos, query e paginação.
-│   │     - `get_thread(...)`: busca o conteúdo completo de uma thread (todas as mensagens).
-│   │     - `simplify_message(...)`: reduz cada mensagem para um dicionário padrão:
-│   │       { timestamp (ISO São Paulo), sender, recipient, subject, body }
-│   │     - `build_gmail_query(...)`: compõe a string de busca (q/after/before).
-│   │     - `unique_thread_ids(...)`: deduplica mensagens por thread preservando ordem.
-│   │
-│   ├── headers.py
-│   │  → (Novo) Lista **única e ordenada** dos 15 campos do cabeçalho da aba `quotes`.
-│   │
-│   ├── prompt.py
-│   │  → (Novo) Instruções do sistema (`SYSTEM_INSTRUCTIONS`) e gerador de prompt
-│   │     (`build_user_prompt(...)`) para a LLM.
-│   │
-│   ├── text_clean.py
-│   │  → (Novo) Limpeza do corpo do e-mail (remove “forwarded”, cabeçalhos repetidos, links/assinaturas).
-│   │
-│   ├── io_email.py
-│   │  → (Novo) Carrega os JSONs de `raw_messages/` (formato com `emails[0]` ou “flat”)
-│   │     e infere timestamp a partir do nome do arquivo quando necessário.
-│   │
-│   └── json_utils.py
-│      → (Novo) Utilitários genéricos: `force_json_object(...)`, `blank_row(...)`, `ensure_dir(...)`.
-│
-├── login_gmail.py
-│  → Responsável pela autenticação (OAuth) e criação do cliente Gmail:
-│    - Usa `credentials/real-credentials-parrots-gmail.json` e salva/renova token em `token_files/token_gmail_v1.json`.
-│    - Escopo padrão: `https://www.googleapis.com/auth/gmail.readonly`.
-│
-├── list_labels.py
-│  → Script de verificação rápida:
-│    - Realiza login e imprime todos os rótulos disponíveis da conta (para validar acesso).
-│
-├── dump_threads.py
-│  → Script principal de coleta:
-│    - Parâmetros:
-│      --label "NOME_DO_ROTULO"   (ex.: QUOTES)  [opcional]
-│      --q     "consulta gmail"   (ex.: from:foo@bar.com has:attachment)  [opcional]
-│      --after YYYY/MM/DD         (ex.: 2025/08/01)  [opcional]
-│      --before YYYY/MM/DD        (ex.: 2025/08/13)  [opcional]
-│      --max   500                (quantidade máx. de mensagens a varrer; não de threads)
-│    - Faz a busca, agrupa por thread e salva 1 arquivo JSON por thread em `raw_messages/`.
-│    - Converte HTML para texto quando não houver `text/plain`.
-│
-├── llm_extract_quotes.py
-│  → (Novo) **Fase 1** — Extração via LLM:
-│    - Lê `raw_messages/*.json`, limpa o corpo e chama o Gemini (API Key no `.env`).
-│    - Enquadra os dados **exatamente** nos 15 campos da aba `quotes`.
-│    - Salva `outputs/quotes_extracted.jsonl` (um objeto JSON por linha).
-│
-└── save_quotes_to_csv.py
-   → (Novo) **Fase 2** — Persistência:
-     - Lê `outputs/quotes_extracted.jsonl` e **faz append na aba `quotes`** da planilha
-       indicada por `SHEET_ID` (no `.env`) usando `utils/login_sheets`.
-     - (Opcional) pode ser adaptado para também gerar `outputs/quotes_extracted.csv`.
+Este README explica:
+
+- Estrutura do projeto  
+- Pré-requisitos (APIs, credenciais, `.env`)  
+- Fluxo detalhado do Labeler  
+- O que você deve ver no Gmail e no GCS ao rodar  
+- Como rodar localmente  
+- Próximos passos naturais (Agente Extrator)
 
 
+## 1. Estrutura do projeto
 
--------------------------------------------------------------------------------
-2) Pré-requisitos
--------------------------------------------------------------------------------
+Estrutura recomendada:
 
-- Ter o arquivo de credenciais OAuth do Google salvo em:
-  `credentials/real-credentials-parrots-gmail.json`
-- Ter credentials/sheets-parrots.json
-- Ter um GEMINI_API_KEY no arquivo dotenv
+    project/
+    │── credentials/
+    │     ├── parrot-gmails.json          # token OAuth do Gmail (já autorizado)
+    │     └── service-account.json        # chave JSON da service account do GCP
+    │
+    │── .env                              # variáveis de ambiente do projeto
+    │── .gitignore
+    │── main.py                           # entrypoint do Labeler
+    │
+    └── app/
+          ├── core/
+          │     ├── config.py             # carrega .env e paths de credencial
+          │     ├── gmail_client.py       # acesso ao Gmail (labels, mensagens, threads)
+          │     ├── gcs_client.py         # acesso ao Google Cloud Storage
+          │     ├── state.py              # controle de estado (threads já processadas)
+          │     └── llm_client.py         # chamadas ao LLM via OpenRouter
+          │
+          └── agents/
+                ├── __init__.py
+                └── labeler_storage_agent.py  # agente Labeler + Storage (2 fases)
 
-Variáveis de ambiente:
 
-# LLM (Gemini)
-GEMINI_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxx
-GEMINI_MODEL_NAME=gemini-1.5-flash   # opcional (pode usar gemini-1.5-pro)
+## 2. Pré-requisitos de ambiente
 
-# Google Sheets
-SHEET_ID=1AbCDeFGhiJKlmnOPqRS_tuvWxYZ1234567890
+### 2.1. Bibliotecas Python
+
+Dentro do seu `venv`, instale:
+
+    pip install python-dotenv google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 google-cloud-storage requests
+
+Essas libs cobrem:
+
+- `.env` → `python-dotenv`
+- Gmail API → `google-api-python-client`, `google-auth-*`
+- Cloud Storage → `google-cloud-storage`
+- LLM via HTTP → `requests`
 
 
--------------------------------------------------------------------------------
-3) Instalação (primeira vez)
--------------------------------------------------------------------------------
+### 2.2. Projeto GCP
 
-1. Crie e ative o ambiente virtual:
-   - macOS/Linux:
-     ```
-     python3 -m venv env
-     source env/bin/activate
-     ```
-   - Windows (PowerShell):
-     ```
-     py -m venv env
-     .\env\Scripts\Activate.ps1
-     ```
+Você está usando o projeto:
 
-2. Instale as dependências:
- ```
- pip install -r requirements.txt
- ```
+    GCP_PROJECT_ID = louro-jose-479223
 
-3. Primeiro teste: listar rótulos (labels)
-------------------------------------------
-$ python3 list_labels.py
+Requisitos:
 
-O que acontece:
-- Na primeira execução, abre-se uma janela do navegador para você autorizar o acesso somente-leitura ao Gmail (escopo: https://www.googleapis.com/auth/gmail.readonly).
-- Ao autorizar, um token é salvo em: token_files/token_gmail_v1.json.
-- Nas próximas execuções, o token é reutilizado e renovado automaticamente sem pedir login.
-- A saída esperada é uma lista de rótulos, por exemplo:
-  📬 Rótulos encontrados:
-   - INBOX
-   - SENT
-   - QUOTES
-   - ...
+- Billing **ativo** no projeto  
+- APIs relevantes habilitadas:
+  - Gmail API  
+  - Cloud Storage (`storage.googleapis.com`)
 
-Se quiser forçar um novo login (ou trocar de conta), apague o arquivo:
-  token_files/token_gmail_v1.json
-e rode novamente o list_labels.py.
 
-3) Coleta: salvar 1 JSON por thread (dump)
-------------------------------------------
-Exemplo por rótulo + janela de datas:
-$ python3 dump_threads.py --label QUOTES --after 2025/08/01 --before 2025/08/13 --max 200
+### 2.3. Bucket no Cloud Storage
 
-Exemplo por consulta livre (sem rótulo):
-$ python3 dump_threads.py --q "from:alguem@empresa.com subject:cotação" --max 100
+Bucket utilizado:
 
-Exemplo combinando rótulo e consulta:
-$ python3 dump_threads.py --label QUOTES --q "from:alguem@empresa.com" --max 200
+    gs://parrot-agents-dev
 
-O que acontece:
-- O script monta a busca usando os parâmetros fornecidos:
-  • --label: restringe a mensagens com o rótulo informado (ex.: QUOTES).
-  • --q: passa a consulta conforme a sintaxe de busca do Gmail (ex.: from:, to:, subject:, has:attachment, etc.).
-  • --after e --before: filtros de data no formato YYYY/MM/DD (padrão do Gmail).
-    - Regra prática: after:D/ M/ A significa “mais recentes que essa data” (exclusivo).
-      before:D/ M/ A significa “mais antigas que essa data” (exclusivo).
-    - Ex.: after:2025/08/01 AND before:2025/08/13 cobre aproximadamente 2025-08-01 até 2025-08-12.
-  • --max: limita a quantidade de MENSAGENS escaneadas na busca (não é o número final de threads).
-- As mensagens encontradas são agrupadas por threadId.
-- Para cada thread:
-  • Baixa-se o conteúdo completo da thread (todas as mensagens).
-  • Cada mensagem é simplificada para {timestamp, sender, recipient, subject, body}.
-  • O corpo (body) prioriza text/plain; se indisponível, converte-se text/html para texto limpo.
-  • As mensagens são ordenadas cronologicamente.
-  • Gera-se um arquivo JSON por thread em raw_messages/.
+Esse bucket será usado para:
 
-4. Onde ver os resultados
--------------------------
-- Os arquivos são gravados em: raw_messages/
-- Nome do arquivo:
-  YYYYMMDD_HHMM__Nome_Email__Assunto.json
-  • YYYYMMDD_HHMM vem do timestamp da primeira mensagem da thread (timezone São Paulo).
-  • Nome_Email é baseado no header “From”.
-  • Assunto é sanitizado para formar um nome de arquivo seguro.
-- Exemplo para inspecionar rapidamente:
-  $ ls -1 raw_messages | head
-  $ cat raw_messages/20250808_1241__Fulano_fulano@exemplo.com__Assunto.json
+- Armazenar threads em `threads/`
+- Armazenar estado em `state/threads_state.json`
 
-5. Fluxo geral (visão resumida)
--------------------------------
-- login_gmail.py: faz OAuth; cria/renova token; retorna o cliente Gmail autenticado.
-- list_labels.py: sanity check — mostra os rótulos disponíveis.
-- dump_threads.py:
-  1) (Opcional) resolve o ID do rótulo informado.
-  2) Monta a query (q/after/before) para a Gmail API.
-  3) Lista mensagens (até --max), agrupa por threadId.
-  4) Para cada thread, busca conteúdo completo, simplifica mensagens e salva 1 JSON em raw_messages/.
-- utils/mime.py: lida com MIME, headers e conversão HTML→texto.
-- utils/gmail_query.py: utilitários para busca, threads e normalização de mensagens.
+No `.env`:
 
-6. Exemplos úteis de consultas (parâmetro --q)
-----------------------------------------------
-- Por remetente:
-  --q "from:alguem@empresa.com"
-- Por assunto contendo palavras:
-  --q "subject:cotação"
-- E-mails com anexos:
-  --q "has:attachment"
-- Múltiplas condições:
-  --q "from:alguem@empresa.com subject:paraty has:attachment"
+    GCS_BUCKET=parrot-agents-dev
 
-7. Fase 1 — Extração via LLM (Gemini)
--------------------------------------
-Execução:
-`$ python3 llm_extract_quotes.py`
 
-O que acontece:
+### 2.4. Service Account (GCS)
 
-- Para cada arquivo em raw_messages/, o corpo é higienizado (remoção de “Forwarded message”, cabeçalhos repetidos, links/assinaturas).
-- O modelo Gemini recebe metadados (timestamp, destinatário, assunto, remetente) e o corpo limpo.
-- A LLM enquadra as informações exatamente nos 15 campos da aba quotes, retornando um JSON por e-mail.
-- O script salva um JSON por linha em outputs/quotes_extracted.jsonl.
-- Observações:
-- Quando alguma informação não existe no e-mail, é gravada como "" (string vazia).
-- O script reforça timestamp/destinatário/assunto a partir dos metadados caso a LLM deixe em branco.
+Service account:
 
-8. Fase 2 — Persistência na Planilha (aba quotes)
--------------------------------------------------
-Execução:
-`$ python3 save_quotes_to_csv.py`
+    parrot-agents-sa@louro-jose-479223.iam.gserviceaccount.com
 
-O que acontece:
+Permissão no projeto (exemplo de binding):
 
-- Lê outputs/quotes_extracted.jsonl.
-- Confere o cabeçalho atual da aba quotes (somente avisa se estiver diferente).
-- Converte cada objeto JSON em uma linha na ordem do cabeçalho e faz append na aba quotes.
-- Possíveis avisos/erros:
-- Cabeçalho diferente: o script apenas alerta e continua o append.
-- 403/permiso: compartilhe a planilha com o e-mail da service account.
-- SHEET_ID vazio: defina no .env.
+    roles/storage.admin
+
+Chave JSON gerada em:
+
+    credentials/service-account.json
+
+O código usa esse arquivo para autenticar no GCS.
+
+
+### 2.5. Token do Gmail (`parrot-gmails.json`)
+
+Na pasta `credentials/`, existe:
+
+    credentials/parrot-gmails.json
+
+Esse arquivo é o **token OAuth** de um usuário Gmail que:
+
+- Já foi autorizado para:
+  - ler emails
+  - modificar rótulos
+- Tem acesso à conta de email que você quer usar no pipeline
+
+Esse token é usado exclusivamente para acessar o Gmail (não usa service account).
+
+
+### 2.6. LLM via OpenRouter
+
+No `.env`, configure:
+
+    OPENROUTER_API_KEY=...          # sua chave OpenRouter
+    OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+    OPENROUTER_MODEL=openai/gpt-4o  # modelo usado para classificação
+
+O cliente `llm_client.py` chama o endpoint:
+
+    POST https://openrouter.ai/api/v1/chat/completions
+
+com:
+
+- Header: `Authorization: Bearer <OPENROUTER_API_KEY>`
+- Body JSON contendo o modelo e as mensagens.
+
+
+## 3. Arquivos principais e responsabilidades
+
+### 3.1. `app/core/config.py` — Configurações
+
+Responsável por:
+
+- Carregar variáveis do `.env`  
+- Expor tudo como `settings.X`  
+- Centralizar paths de credenciais
+
+Principais campos:
+
+- `settings.GCP_PROJECT_ID`
+- `settings.GCS_BUCKET`
+- `settings.GMAIL_LABEL` (padrão `"QUOTES"`)
+- `settings.SHEET_ID` (ainda não usado nesta fase)
+- `settings.OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `OPENROUTER_MODEL`
+- `settings.GMAIL_TOKEN_FILE` → `credentials/parrot-gmails.json`
+- `settings.SERVICE_ACCOUNT_FILE` → `credentials/service-account.json`
+
+Esse módulo é o “cérebro de configuração” do projeto: qualquer mudança de projeto/bucket/modelo é feita aqui ou no `.env`, sem precisar mexer no resto do código.
+
+
+### 3.2. `app/core/gmail_client.py` — Cliente Gmail
+
+Este módulo encapsula toda a interação com o Gmail.
+
+Funções principais:
+
+1. `get_or_create_label(label_name)`
+
+   - Verifica se o label existe no Gmail.
+   - Se não existir, cria.
+   - Retorna o **ID interno** do label (por exemplo, `Label_123456`).
+
+2. `search_messages(query)`
+
+   - Busca mensagens usando a sintaxe de pesquisa do Gmail (a mesma da barra de busca).
+   - Exemplo de query usada:
+     - `newer_than:50d` → pega emails dos últimos 50 dias.
+   - Faz paginação para buscar todas as mensagens que batem com a query.
+   - Retorna uma lista de dicionários como:
+     - `{"id": "<MESSAGE_ID>"}`.
+
+3. `get_message(message_id, fmt="full")`
+
+   - Retorna uma mensagem completa (headers, payload com body, labels, etc.).
+
+4. `add_label_to_message(message_id, label_id)`
+
+   - Adiciona um label específico a uma mensagem.
+   - Do ponto de vista do usuário, isso faz a thread aparecer com aquele label.
+
+5. `list_threads_with_label(label_id)`
+
+   - Lista threads que possuem o label informado.
+   - Cada item contém ao menos `{"id": "<THREAD_ID>"}`.
+
+6. `get_thread(thread_id)`
+
+   - Retorna o conteúdo completo da thread, incluindo todas as mensagens:
+     - `thread["messages"]` é a lista de emails daquela conversa.
+
+7. `decode_email(message)`
+
+   - Decodifica o body em base64 e retorna um objeto `email.message.EmailMessage`.
+   - Permite extrair o texto do corpo do email (plain text).
+
+O objetivo desse módulo é deixar o agente o mais “limpo” possível, evitando repetição de código da API do Gmail.
+
+
+### 3.3. `app/core/gcs_client.py` — Cliente GCS
+
+Responsável por:
+
+- Conectar ao Cloud Storage usando a **service account** (`service-account.json`)  
+- Salvar JSONs no bucket  
+- Ler JSONs do bucket
+
+Funções:
+
+- `upload_json(path, data)`  
+  - Serializa `data` (dict) para JSON.
+  - Faz upload para `gs://<bucket>/<path>`.
+  - Exemplos de paths:
+    - `threads/<THREAD_ID>.json`
+    - `state/threads_state.json`
+
+- `download_json(path)`  
+  - Se o arquivo existir, baixa o conteúdo e faz `json.loads(...)`.
+  - Se não existir, retorna `None`.
+
+É usado por `state.py` e pelo próprio agente para persistência no GCS.
+
+
+### 3.4. `app/core/state.py` — Controle incremental de threads
+
+Controla até onde cada thread já foi processada (qual foi o último email verificado).
+
+Arquivo de estado é salvo em:
+
+    gs://parrot-agents-dev/state/threads_state.json
+
+Formato:
+
+    {
+      "THREAD_ID_1": { "last_email_id": "MSG_ID_10" },
+      "THREAD_ID_2": { "last_email_id": "MSG_ID_7" }
+    }
+
+Funções:
+
+- `get_last_email(thread_id)`  
+  - Retorna o último email processado daquela thread (ou `None` se nunca processou).
+
+- `update_thread(thread_id, last_email_id)`  
+  - Atualiza o estado em memória.
+  - Persiste o JSON atualizado no GCS.
+  - É chamado sempre que uma thread é salva/atualizada no Storage.
+
+Esse estado é usado na **Fase 2** para evitar reprocessar threads que não tiveram novos emails desde a última execução do agente.
+
+
+### 3.5. `app/core/llm_client.py` — LLM via OpenRouter
+
+Responsável por falar com o LLM (por exemplo, GPT-4o) via API do OpenRouter.
+
+Função principal:
+
+    classify_email(self, text: str) -> str
+
+Ela:
+
+1. Monta um prompt em português para o modelo:
+
+       Você é um classificador de emails.
+
+       Responda APENAS com uma das opções:
+
+       - VIAGEM
+       - NAO-VIAGEM
+
+       Essa classificação deve identificar emails que são:
+       - cotações de hotel
+       - mensagens de fornecedores de hospedagem
+       - respostas sobre disponibilidade, tarifas, política de cancelamento
+       - temas relacionados a viagens
+
+       Email:
+       <texto do email>
+
+2. Faz uma requisição `POST` para:
+
+       https://openrouter.ai/api/v1/chat/completions
+
+   usando o modelo configurado em `OPENROUTER_MODEL` (por exemplo, `openai/gpt-4o`).
+
+3. Lê a resposta do modelo, converte para maiúsculas e normaliza:
+   - Se a resposta contiver “VIAGEM”, retorna `"VIAGEM"`.
+   - Caso contrário, retorna `"NAO-VIAGEM"`.
+
+O agente usa esse resultado para decidir se aplica o label `QUOTES` ou ignora o email.
+
+
+### 3.6. `app/agents/labeler_storage_agent.py` — Agente Labeler + Storage
+
+Este é o agente que liga tudo:
+
+- Gmail
+- LLM (classificação)
+- Label QUOTES
+- Cloud Storage
+- Estado incremental
+
+Ele possui **duas fases** bem definidas:
+
+#### Fase 1 — Classificação + Rotulagem (LLM → `QUOTES`)
+
+Objetivo:  
+Percorrer os emails recentes e rotular como `QUOTES` todos aqueles que o modelo entender que são de viagem/cotação/fornecedor de hospedagem.
+
+Passos da Fase 1:
+
+1. Garante que o label `QUOTES` existe:
+
+       label_id = gmail_client.get_or_create_label(settings.GMAIL_LABEL)
+
+2. Busca emails dos últimos 50 dias:
+
+       messages = gmail_client.search_messages("newer_than:50d")
+
+3. Para cada mensagem (`msg_id`):
+
+   - Baixa a mensagem completa:
+
+         email_obj = gmail_client.get_message(msg_id, fmt="full")
+
+   - Verifica se ela já tem o label `QUOTES`:
+     - Se tiver, pula a classificação (já foi classificada em execução anterior).
+
+   - Decodifica o corpo do email em texto (`decode_email`).
+
+   - Envia o texto para o LLM:
+
+         classification = llm_client.classify_email(text[:8000])
+
+   - Se `classification == "VIAGEM"`:
+     - Aplica o label `QUOTES` nesse email (o que, visualmente, faz a thread aparecer com aquele label):
+
+           gmail_client.add_label_to_message(msg_id, label_id)
+
+   - Se `classification == "NAO-VIAGEM"`:
+     - Ignora o email (não recebe label QUOTES).
+
+Resultado da Fase 1:
+
+- Seu Gmail passa a ter o label `QUOTES` em todas as conversas de viagem/cotação detectadas pelo LLM.
+- Threads não relacionadas a viagem/cotação permanecem sem esse label.
+
+
+#### Fase 2 — Threads com QUOTES → Storage + Estado
+
+Objetivo:  
+Pegar todas as threads que possuem o label `QUOTES`, salvar no Cloud Storage e marcar no estado qual foi o último email processado em cada thread.
+
+Passos da Fase 2:
+
+1. Lista as threads com o label `QUOTES`:
+
+       threads = gmail_client.list_threads_with_label(label_id)
+
+2. Para cada `thread_id`:
+
+   - Baixa a thread completa:
+
+         thread_full = gmail_client.get_thread(thread_id)
+         messages = thread_full.get("messages", [])
+
+   - Se não houver mensagens, pula.
+
+   - Descobre o ID do último email da thread:
+
+         last_email_id = messages[-1]["id"]
+
+   - Consulta o estado atual:
+
+         last_processed = state.get_last_email(thread_id)
+
+   - Se `last_processed == last_email_id`:
+     - Conclusão: nada novo foi adicionado à thread desde a última execução.
+     - Resultado: a thread é ignorada (já está sincronizada).
+
+   - Caso contrário:
+
+     - Salva a thread completa no GCS:
+
+           gcs_client.upload_json(f"threads/{thread_id}.json", thread_full)
+
+     - Atualiza o estado com o novo `last_email_id`:
+
+           state.update_thread(thread_id, last_email_id)
+
+Resultado da Fase 2:
+
+- Todas as threads de viagem (rotuladas como `QUOTES`) são salvas no bucket, cada uma como um JSON:
+  - `threads/<THREAD_ID>.json`
+- O estado é atualizado em:
+  - `state/threads_state.json`
+- Execuções futuras do agente são incrementais:
+  - Threads sem novos emails não são regravadas no Storage.
+  - Threads com novos emails são sincronizadas novamente.
+
+
+### 3.7. `main.py` — Entry point
+
+Arquivo simples que apenas executa o agente:
+
+    from app.agents.labeler_storage_agent import labeler_storage_agent
+
+    if __name__ == "__main__":
+        labeler_storage_agent.run()
+
+
+## 4. O que você deve ver ao executar o código
+
+### 4.1. Comando de execução
+
+Na raiz do projeto:
+
+    python main.py
+
+### 4.2. Logs esperados no terminal
+
+Saída típica:
+
+    🔵 Iniciando Labeler com LLM (2 fases)
+    ✓ Label encontrado/criado: QUOTES (id=Label_XXXXXXX)
+
+    📥 Fase 1: buscando emails (newer_than:50d)...
+    → Encontrados 123 emails nos últimos 50 dias.
+
+    📨 Email 18762f93a12 sendo analisado pelo LLM...
+    → Classificação LLM: VIAGEM
+       ✓ Label QUOTES aplicado a este email (e thread).
+
+    📨 Email 18762f93b55 sendo analisado pelo LLM...
+    → Classificação LLM: NAO-VIAGEM
+       → Classificado como NAO-VIAGEM, ignorando.
+
+    📨 Email 18762f93c09 já tem QUOTES, pulando fase de classificação.
+    ...
+
+    📂 Fase 2: sincronizando threads com QUOTES para o Storage...
+    → Encontradas 15 threads com QUOTES.
+
+    📦 Processando thread 179cc4f83a...
+    [GCS] Upload OK → threads/179cc4f83a.json
+    [STATE] Thread 179cc4f83a atualizada → último email 18763a8f2eb34
+       ✓ Thread salva no Storage e estado atualizado.
+
+    📦 Processando thread 890bb43fe2...
+       → Nenhum email novo na thread desde o último processamento, pulando.
+
+    🏁 Labeler finalizado com sucesso.
+
+IDs, quantidades e textos variam, mas o fluxo geral deve seguir esse padrão.
+
+
+### 4.3. O que deve aparecer no Gmail
+
+Depois de rodar o agente:
+
+- Emails (e suas respectivas conversas) relacionados a:
+  - cotações de hotel
+  - fornecedores de hospedagem
+  - informações de tarifas, disponibilidade
+  - políticas de cancelamento/pagamento
+- …devem aparecer com o **label `QUOTES`** no Gmail.
+
+Alguns comportamentos importantes:
+
+- Emails já rotulados como `QUOTES` são detectados e não são reclassificados.
+- Emails nos últimos 50 dias que antes não tinham label são analisados pelo LLM:
+  - Se forem de viagem/cotação, passam a ter o label `QUOTES`.
+  - Se não forem, permanecem sem esse label.
+
+
+### 4.4. O que deve aparecer no Cloud Storage
+
+No bucket `parrot-agents-dev`, você deve ver:
+
+1. Pasta `threads/`:
+
+       threads/
+        ├── 179cc4f83a.json
+        ├── 890bb43fe2.json
+        ├── ...
+
+   Cada arquivo JSON representa uma **thread completa** marcada com `QUOTES`.
+
+   O conteúdo inclui:
+
+   - `id`: id da thread
+   - `messages`: lista de emails da thread
+     - cada mensagem com:
+       - `id`
+       - `payload` (headers, corpo codificado etc.)
+       - `threadId`
+       - `labelIds` (incluindo `QUOTES`)
+
+2. Pasta `state/`:
+
+       state/
+        └── threads_state.json
+
+   Exemplo de conteúdo:
+
+       {
+         "179cc4f83a": {
+           "last_email_id": "18763a8f2eb34"
+         },
+         "890bb43fe2": {
+           "last_email_id": "18766bbf441ae"
+         }
+       }
+
+   Isso mostra:
+
+   - Quais threads já foram sincronizadas.
+   - Qual foi o último email considerado em cada thread.
+
+Execuções futuras:
+
+- Se nenhuma nova mensagem entrar numa thread `QUOTES`, ela não será regravada.
+- Se novos emails forem adicionados à thread, o agente:
+  - baixará a thread atualizada,
+  - salvará novamente o JSON da thread,
+  - atualizará o `last_email_id` no arquivo de estado.
+
+
+## 5. Próximos passos naturais
+
+Depois deste Labeler estar funcional e validado, os próximos passos naturais do projeto são:
+
+1. **Agente Extrator (ExtractorAgent)**
+
+   - Ler os arquivos `threads/*.json` no GCS.
+   - Para cada thread, extrair informações estruturadas de acordo com o cabeçalho:
+
+         HEADER_FIELDS = [
+             "Timestamp",
+             "Fornecedor",
+             "Assunto",
+             "Nome do hotel",
+             "Cidade",
+             "Check-in",
+             "Check-out",
+             "Número de quartos",
+             "Descrição dos Quartos",
+             "Categoria do quarto",
+             "Preço (num)",
+             "Configuração do quarto",
+             "Tarifa NET ou comissionada?",
+             "Taxa? Ex.: 5% de ISS",
+             "Serviços incluso? Explicação: existem hotéis que consideram a tarifa de serviço já incluso e outros não.",
+             "Política de pagamento",
+             "Política de cancelamento",
+         ]
+
+   - Esse agente provavelmente também usará LLM para:
+     - identificar blocos relevantes em cada email da thread,
+     - extrair campos, normalizar datas, valores etc.
+   - Salvar o resultado em:
+     - uma aba de Google Sheets, e/ou
+     - uma tabela em BigQuery, para análise posterior.
+
+2. **Dockerizar o projeto**
+
+   - Criar um `Dockerfile` com:
+     - instalação das dependências,
+     - cópia do código,
+     - `ENTRYPOINT` chamando o `main.py`.
+   - Enviar a imagem para o Artifact Registry.
+   - Criar um **Cloud Run Job** que executa esse container.
+
+3. **Agendar execução diária**
+
+   - Usar o Cloud Scheduler para acionar o Cloud Run Job diariamente (por exemplo, às 07:00 BRT).
+   - Todo dia, o pipeline:
+     - lê emails novos dos últimos X dias,
+     - classifica com LLM,
+     - rotula como `QUOTES`,
+     - sincroniza as threads para o Storage,
+     - (e depois, com o Extrator) atualiza a base estruturada em Sheets/BigQuery.
+
+Com isso, você terá um fluxo agente-based robusto, incremental e pronto para ser expandido com novos agentes (por exemplo, Extrator, Normalizador, Consolidator, etc.).
