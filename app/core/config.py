@@ -15,8 +15,14 @@ class Settings:
     GMAIL_LABEL = os.getenv("GMAIL_LABEL", "QUOTES")
     GMAIL_TOKEN_FILE = "credentials/gmail-token.json"
 
-    # --- Google Sheets ---
+    # --- Google Sheets (genérico antigo, se estiver em uso em outro lugar) ---
     SHEET_ID = os.getenv("SHEET_ID")
+
+    # --- Google Sheets (para o louro-jose / quotes_raw) ---
+    # ID da planilha (aquele do link)
+    SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID")
+    # Nome da guia onde vamos jogar as cotações
+    SHEETS_QUOTE_SHEET_NAME = os.getenv("SHEETS_QUOTE_SHEET_NAME", "quotes_raw")
 
     # --- LLM (OpenRouter) ---
     OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
