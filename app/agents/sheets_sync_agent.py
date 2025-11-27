@@ -37,7 +37,7 @@ class SheetsSyncAgent:
         )
         self.gc = gspread.authorize(credentials)
 
-        # Caminho do arquivo tabular no GCS
+        # Caminho do arquivo tabular no GCS (lote da execução atual)
         self.quotes_path = "tables/quotes_raw.json"
 
     def _load_quotes(self) -> List[Dict[str, Any]]:
@@ -67,6 +67,10 @@ class SheetsSyncAgent:
         quotes = self._load_quotes()
         print(f"→ {len(quotes)} linhas lidas de {self.quotes_path}")
 
+        if not quotes:
+            print("ℹ️ Nenhuma cotação para sincronizar com a planilha.")
+            return
+
         # Abre a planilha
         sh = self.gc.open_by_key(self.spreadsheet_id)
 
@@ -82,19 +86,82 @@ class SheetsSyncAgent:
                 cols=str(len(ALL_FIELDS) + 10),
             )
 
-        # Monta matriz de valores: primeira linha = header
-        values = [ALL_FIELDS] + self._to_rows(quotes)
+        # --------------------------------------------------
+        # 1) Garante que o cabeçalho esteja na linha 1
+        # --------------------------------------------------
+        header = ws.row_values(1)
+        if not header:
+            # aba vazia: escreve o header em A1
+            print("→ Cabeçalho não encontrado, escrevendo header em A1.")
+            ws.update("A1", [ALL_FIELDS])
+        else:
+            print("→ Cabeçalho já existente na planilha (não alterado).")
 
-        print("→ Limpando aba antes de escrever...")
-        ws.clear()
+        # --------------------------------------------------
+        # 2) Descobre em qual coluna está o _key
+        # --------------------------------------------------
+        try:
+            key_col_index = ALL_FIELDS.index("_key") + 1  # 1-based (A=1, B=2, ...)
+        except ValueError:
+            print("⚠️ '_key' não encontrado em ALL_FIELDS; não será possível fazer deduplicação.")
+            key_col_index = None
 
-        print(f"→ Escrevendo {len(values) - 1} linhas na planilha...")
-        # Escreve tudo começando em A1
-        ws.update("A1", values)
+        # --------------------------------------------------
+        # 3) Lê todas as _key já existentes na planilha
+        # --------------------------------------------------
+        existing_keys = set()
+        if key_col_index is not None:
+            col_values = ws.col_values(key_col_index)
+            if col_values:
+                # col_values[0] é o header; o resto são as chaves já existentes
+                existing_keys = set(col_values[1:])
 
-        print("✅ Planilha atualizada com sucesso.")
+        print(f"→ Já existem {len(existing_keys)} chaves (_key) na planilha.")
+
+        # --------------------------------------------------
+        # 4) Monta apenas as linhas novas (por _key)
+        # --------------------------------------------------
+        rows_to_append = []
+        new_count = 0
+        dup_count = 0
+
+        for q in quotes:
+            key = q.get("_key")
+            if not key:
+                # segurança: se por algum motivo vier sem _key, ignora
+                continue
+
+            if key in existing_keys:
+                dup_count += 1
+                continue
+
+            row = [q.get(field, "") for field in ALL_FIELDS]
+            rows_to_append.append(row)
+            existing_keys.add(key)
+            new_count += 1
+
+        if not rows_to_append:
+            print(
+                f"ℹ️ Nenhuma nova linha para adicionar à planilha "
+                f"({dup_count} duplicadas ignoradas)."
+            )
+            return
+
+        # --------------------------------------------------
+        # 5) Append das novas linhas
+        # --------------------------------------------------
+        print(
+            f"→ Adicionando {new_count} novas linhas na planilha "
+            f"({dup_count} duplicadas ignoradas)..."
+        )
+
+        ws.append_rows(rows_to_append, value_input_option="RAW")
+
+        print("✅ Planilha atualizada com sucesso (append com deduplicação por _key).")
+
+
+sheets_sync_agent = SheetsSyncAgent()
 
 
 if __name__ == "__main__":
-    agent = SheetsSyncAgent()
-    agent.run()
+    sheets_sync_agent.run()

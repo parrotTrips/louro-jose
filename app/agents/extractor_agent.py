@@ -36,6 +36,17 @@ HEADER_FIELDS = [
     "Email do remetente (top-level)",
 ]
 
+# Campos usados para gerar uma chave estável (_key) por cotação
+IDENTITY_FIELDS_FOR_KEY = [
+    "Nome do hotel",
+    "Cidade",
+    "Check-in",
+    "Check-out",
+    "Categoria do quarto",
+    "Configuração do quarto",
+    "Preço (num)",
+]
+
 FIELDS_JSON = json.dumps(HEADER_FIELDS, ensure_ascii=False, indent=2)
 
 SYSTEM_PROMPT = (
@@ -90,9 +101,25 @@ def _thread_id_from_blob_name(blob_name: str) -> str:
     return blob_name.split("/")[-1].replace(".json", "")
 
 
-def _make_row_key(thread_id: str, idx: int) -> str:
-    # chave técnica única por linha de cotação
-    raw = f"{thread_id}#{idx}"
+def _make_row_key(thread_id: str, row: Dict[str, Any]) -> str:
+    """
+    Gera uma chave técnica (_key) estável por cotação.
+
+    Usa:
+      - thread_id
+      - um subconjunto de campos de identidade da cotação (hotel, cidade, datas, quarto, preço)
+
+    Assim:
+      - Se reprocessarmos a mesma thread e o LLM extrair a mesma cotação,
+        o _key será o mesmo, mesmo que a ordem mude.
+      - Se o fornecedor mandar nova cotação ou alterar preço/datas/quarto,
+        o _key muda (nova versão).
+    """
+    parts = [thread_id]
+    for field in IDENTITY_FIELDS_FOR_KEY:
+        parts.append(str(row.get(field, "")).strip())
+
+    raw = "||".join(parts)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -357,12 +384,18 @@ class ExtractorAgent:
     # Estado incremental
     # ---------------------------
     def _load_state(self) -> Dict[str, Dict[str, Any]]:
-        """Carrega o estado do extrator do GCS (ou {} se não existir)."""
+        """
+        Carrega o estado do extrator do GCS (ou {} se não existir).
+
+        Formato esperado (por thread_id):
+        {
+          "last_message_id": "...",
+          "last_row_count": 4,
+          "processed": true  # legado (opcional)
+        }
+        """
         data = gcs_client.download_json(self.state_path)
-        if data is None:
-            return {}
-        if not isinstance(data, dict):
-            # sanity check simples
+        if data is None or not isinstance(data, dict):
             return {}
         return data
 
@@ -370,15 +403,31 @@ class ExtractorAgent:
         """Persiste o estado do extrator no GCS."""
         gcs_client.upload_json(self.state_path, self.state)
 
-    def _is_processed(self, thread_id: str) -> bool:
-        """Retorna True se a thread já foi processada com sucesso."""
-        info = self.state.get(thread_id)
-        return bool(info and info.get("processed"))
+    def _is_up_to_date(self, thread_id: str, last_message_id: str) -> bool:
+        """
+        Retorna True se a thread não teve novos e-mails desde a última extração.
 
-    def _mark_processed(self, thread_id: str, row_count: int) -> None:
-        """Marca uma thread como processada com sucesso."""
+        - Usa last_message_id salvo no estado.
+        - Se o estado for legado (sem last_message_id), retornamos False
+          para forçar uma primeira reextração com o novo modelo.
+        """
+        if not last_message_id:
+            return False
+
+        info = self.state.get(thread_id) or {}
+        stored = info.get("last_message_id") or ""
+
+        # Se não havia last_message_id antes (estado antigo), consideramos desatualizado
+        if not stored:
+            return False
+
+        return stored == last_message_id
+
+    def _mark_processed(self, thread_id: str, last_message_id: str, row_count: int) -> None:
+        """Marca uma thread como processada, armazenando o último message_id e contagem de linhas."""
         self.state[thread_id] = {
-            "processed": True,
+            "processed": True,           # mantido por compatibilidade / debug
+            "last_message_id": last_message_id,
             "last_row_count": row_count,
         }
 
@@ -433,7 +482,7 @@ class ExtractorAgent:
 
             row["_thread_id"] = thread_id
             row["_row_index_in_thread"] = i
-            row["_key"] = _make_row_key(thread_id, i)
+            row["_key"] = _make_row_key(thread_id, row)
 
             rows.append(row)
 
@@ -447,33 +496,38 @@ class ExtractorAgent:
 
         blob_names = self.list_thread_objects()
         print(f"→ Encontrados {len(blob_names)} arquivos em threads/")
-
-        already = sum(1 for b in blob_names if self._is_processed(_thread_id_from_blob_name(b)))
-        print(f"→ {already} threads já marcadas como processadas no estado; serão puladas.")
+        print(f"→ Estado atual contém {len(self.state)} threads já vistas.")
 
         all_rows: List[Dict[str, Any]] = []
 
         for blob_name in blob_names:
             thread_id = _thread_id_from_blob_name(blob_name)
 
-            if self._is_processed(thread_id):
-                print(f"⏭️  Thread {thread_id} já processada anteriormente, pulando.")
+            thread_data = gcs_client.download_json(blob_name)
+            if not thread_data:
+                print(f"   ⚠️ Thread {thread_id}: arquivo vazio ou não encontrado, pulando.")
+                continue
+
+            messages = thread_data.get("messages") or []
+            if not messages:
+                print(f"   ⚠️ Thread {thread_id}: sem mensagens, pulando.")
+                continue
+
+            last_message_id = (messages[-1].get("id") or "").strip()
+
+            if self._is_up_to_date(thread_id, last_message_id):
+                print(f"⏭️  Thread {thread_id} sem novos emails desde a última extração, pulando.")
                 continue
 
             print(f"📦 Processando thread {thread_id} ({blob_name})...")
-
-            thread_data = gcs_client.download_json(blob_name)
-            if not thread_data:
-                print("   → Arquivo vazio ou não encontrado, pulando.")
-                continue
 
             try:
                 rows = self.extract_thread(thread_id, thread_data)
                 print(f"   → {len(rows)} cotações extraídas.")
                 all_rows.extend(rows)
 
-                # Marca como processada, mesmo que 0 linhas (LLM decidiu que não é cotação)
-                self._mark_processed(thread_id, len(rows))
+                # Marca como processada (mesmo que 0 linhas – LLM decidiu que não é cotação)
+                self._mark_processed(thread_id, last_message_id, len(rows))
 
             except Exception as e:
                 # NÃO marca como processada em caso de erro, para tentar de novo na próxima execução
@@ -484,10 +538,53 @@ class ExtractorAgent:
 
         print(f"✅ Extração concluída. Total de linhas novas nesta execução: {len(all_rows)}")
 
-        # Salva tudo em um único JSON array tabular
+        # --------------------------------------------------
+        # 1) STAGING: sobrescreve com apenas esta execução
+        # --------------------------------------------------
         output_path = "tables/quotes_raw.json"
         gcs_client.upload_json(output_path, all_rows)
         print(f"📂 Tabela (parcial desta execução) salva em gs://{self.bucket_name}/{output_path}")
+
+        # --------------------------------------------------
+        # 2) HISTÓRICO: acumula tudo em tables/quotes_history.json
+        #    usando _key para não duplicar linhas
+        # --------------------------------------------------
+        if all_rows:
+            history_path = "tables/quotes_history.json"
+
+            # Tenta carregar o histórico existente
+            existing_history = gcs_client.download_json(history_path)
+            if not isinstance(existing_history, list):
+                existing_history = []
+
+            # Dict chave -> linha (mantém o que já existia e adiciona novos)
+            by_key: Dict[str, Dict[str, Any]] = {}
+
+            # 2.1. Mantém todas as linhas já existentes no histórico
+            for row in existing_history:
+                key = row.get("_key")
+                if key and key not in by_key:
+                    by_key[key] = row
+
+            # 2.2. Adiciona apenas linhas novas desta execução
+            new_count = 0
+            for row in all_rows:
+                key = row.get("_key")
+                if not key:
+                    # segurança extra: se, por algum bug, alguma linha vier sem _key, pula
+                    continue
+                if key not in by_key:
+                    by_key[key] = row
+                    new_count += 1
+
+            new_history = list(by_key.values())
+            gcs_client.upload_json(history_path, new_history)
+            print(
+                f"📚 Histórico atualizado em gs://{self.bucket_name}/{history_path} "
+                f"(novas linhas únicas: {new_count}, total acumulado: {len(new_history)})"
+            )
+        else:
+            print("ℹ️ Nenhuma linha nova nesta execução; histórico não foi modificado.")
 
 
 extractor_agent = ExtractorAgent()
