@@ -1,19 +1,20 @@
-# app/agents/extractor_agent.py
-
 import json
 import hashlib
 import base64
+import logging
 import re
-from typing import List, Dict, Any
-
-from google.cloud import storage
+from typing import Any, Dict, List, Optional
 
 from app.core.config import settings
-from app.core.gcs_client import gcs_client
-from app.core.llm_client import llm_client
+from app.core.gcs_client import make_gcs_client
+from app.core.llm_client import make_llm_client
 
+logger = logging.getLogger(__name__)
 
-# Campos que queremos (colunas da tabela)
+# ---------------------------------------------------------------------------
+# Schema / prompts
+# ---------------------------------------------------------------------------
+
 HEADER_FIELDS = [
     "Timestamp",
     "Fornecedor",
@@ -36,7 +37,6 @@ HEADER_FIELDS = [
     "Email do remetente (top-level)",
 ]
 
-# Campos usados para gerar uma chave estável (_key) por cotação
 IDENTITY_FIELDS_FOR_KEY = [
     "Nome do hotel",
     "Cidade",
@@ -61,8 +61,7 @@ SYSTEM_PROMPT = (
     "  1 casal + 1 solteiro, 3 solteiros, triplo, quádruplo, king, queen).\n"
     "\n"
     "Campo **Descrição dos Quartos** (obrigatório e **específico da cotação**):\n"
-    "- Deve conter **apenas a descrição referente à categoria/configuração daquela cotação** (uma linha/bullet curto).\n"
-    "- Se houver um bloco com várias categorias, selecione **somente** o trecho da categoria correspondente.\n"
+    "- Deve conter **apenas a descrição referente à categoria/configuração daquela cotação**.\n"
     "- Se não houver trecho específico, **sintetize** curto a partir dos campos (ex.: `Standard: SGL/DBL`).\n"
     "- **Não inclua preços** e não repita políticas gerais, taxas, café da manhã etc.\n"
 )
@@ -91,40 +90,25 @@ Trechos relevantes da thread (selecionados e limpos):
 ----------------
 """
 
+EXTRACTOR_STATE_PATH = "state/extractor_state.json"
 
-# =====================================================
-# Helpers para trabalhar com a estrutura do Gmail
-# =====================================================
+# ---------------------------------------------------------------------------
+# Pure helper functions
+# ---------------------------------------------------------------------------
 
 def _thread_id_from_blob_name(blob_name: str) -> str:
-    # ex: "threads/1988a581579a47bf.json" -> "1988a581579a47bf"
     return blob_name.split("/")[-1].replace(".json", "")
 
 
 def _make_row_key(thread_id: str, row: Dict[str, Any]) -> str:
-    """
-    Gera uma chave técnica (_key) estável por cotação.
-
-    Usa:
-      - thread_id
-      - um subconjunto de campos de identidade da cotação (hotel, cidade, datas, quarto, preço)
-
-    Assim:
-      - Se reprocessarmos a mesma thread e o LLM extrair a mesma cotação,
-        o _key será o mesmo, mesmo que a ordem mude.
-      - Se o fornecedor mandar nova cotação ou alterar preço/datas/quarto,
-        o _key muda (nova versão).
-    """
     parts = [thread_id]
     for field in IDENTITY_FIELDS_FOR_KEY:
         parts.append(str(row.get(field, "")).strip())
-
     raw = "||".join(parts)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
 def _get_header(headers: List[Dict[str, str]], name: str) -> str:
-    """Pega um header pelo nome (case-insensitive)."""
     name_low = name.lower()
     for h in headers or []:
         if h.get("name", "").lower() == name_low:
@@ -142,74 +126,46 @@ def _decode_b64(data: str) -> str:
 
 
 def _extract_body_from_payload(payload: Dict[str, Any]) -> str:
-    """
-    Extrai texto do corpo a partir do payload do Gmail.
-    Prioriza text/plain; se não tiver, usa text/html (removendo tags).
-    """
     if not payload:
         return ""
 
-    mime_type = payload.get("mimeType", "") or ""
     body = payload.get("body", {}) or {}
     parts = payload.get("parts") or []
 
-    # Caso simples: sem multipart
     if not parts and body.get("data"):
-        text = _decode_b64(body.get("data", ""))
-        return text
+        return _decode_b64(body["data"])
 
-    # Multipart: procura text/plain primeiro
-    chosen = None
+    # Search for text/plain first
     stack = list(parts)
     while stack:
         part = stack.pop()
         p_mime = (part.get("mimeType") or "").lower()
         if p_mime == "text/plain" and part.get("body", {}).get("data"):
-            chosen = _decode_b64(part["body"]["data"])
-            break
-        # acumula para procurar text/html depois
+            return _decode_b64(part["body"]["data"])
         if p_mime.startswith("multipart/"):
             stack.extend(part.get("parts") or [])
 
-    if chosen:
-        return chosen
-
-    # Se não achou text/plain, tenta text/html
+    # Fallback to text/html
     stack = list(parts)
-    html_text = ""
     while stack:
         part = stack.pop()
         p_mime = (part.get("mimeType") or "").lower()
         if p_mime == "text/html" and part.get("body", {}).get("data"):
-            html_text = _decode_b64(part["body"]["data"])
-            break
+            html = _decode_b64(part["body"]["data"])
+            html = re.sub(r"(?i)<br\s*/?>", "\n", html)
+            html = re.sub(r"(?i)</p>", "\n", html)
+            html = re.sub(r"<[^>]+>", " ", html)
+            html = re.sub(r"\s+", " ", html)
+            return html.strip()
         if p_mime.startswith("multipart/"):
             stack.extend(part.get("parts") or [])
-
-    if html_text:
-        # converte HTML simples para texto
-        html_text = re.sub(r"(?i)<br\s*/?>", "\n", html_text)
-        html_text = re.sub(r"(?i)</p>", "\n", html_text)
-        html_text = re.sub(r"<[^>]+>", " ", html_text)
-        html_text = re.sub(r"\s+", " ", html_text)
-        return html_text.strip()
 
     return ""
 
 
 def _strip_reply_history_and_signature(body: str) -> str:
-    """
-    Remove:
-    - histórico de respostas encaminhadas
-    - linhas citadas (começando com '>')
-    - disclaimers padrão de confidencialidade
-    mantendo só o miolo útil da resposta do hotel.
-    """
     if not body:
         return ""
-
-    lines = body.splitlines()
-    cleaned: List[str] = []
 
     stop_markers = [
         "mensagem encaminhada",
@@ -225,47 +181,38 @@ def _strip_reply_history_and_signature(body: str) -> str:
         "se voce nao for o destinatario",
     ]
 
-    for line in lines:
-        l = line.strip()
-        low = l.lower()
-
+    cleaned: List[str] = []
+    for line in body.splitlines():
+        low = line.strip().lower()
         if any(m in low for m in disclaimer_markers):
             break
         if any(m in low for m in stop_markers):
             break
         if low.startswith(">"):
-            # histórico citado
             continue
         if low.startswith("em ") and "escreveu" in low:
-            # "Em 12 de março, Fulano escreveu:"
             break
-
         cleaned.append(line)
 
     text = "\n".join(cleaned).strip()
-    # comprime múltiplas linhas em branco
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text
+    return re.sub(r"\n{3,}", "\n\n", text)
 
 
 def _score_message(from_email: str, body: str) -> int:
-    """
-    Score simples para priorizar:
-    - mensagens do hotel (não parrottrips)
-    - com preço e vocabulário de cotação
-    - penaliza mensagens muito curtas/de agradecimento
-    """
     if not body:
-        return -999  # impróprio
+        return -999
 
     text = body.lower()
     score = 0
 
     if from_email and "parrottrips.com" not in from_email.lower():
-        score += 2  # vem do hotel/fornecedor
+        score += 2
 
-    # presença de preço
-    if re.search(r"r\$\s*\d", text) or re.search(r"\d{1,3}\.\d{3},\d{2}", text) or re.search(r"\d+,\d{2}", text):
+    if (
+        re.search(r"r\$\s*\d", text)
+        or re.search(r"\d{1,3}\.\d{3},\d{2}", text)
+        or re.search(r"\d+,\d{2}", text)
+    ):
         score += 3
 
     keywords = [
@@ -274,88 +221,60 @@ def _score_message(from_email: str, body: str) -> int:
         "superior", "check-in", "check in", "check-out", "check out",
         "café da manhã", "cafe da manha", "pensão", "pensao", "regime",
     ]
-    kw_hits = sum(1 for kw in keywords if kw in text)
-    score += min(kw_hits, 3)
+    score += min(sum(1 for kw in keywords if kw in text), 3)
 
-    # penaliza mensagens muito curtas / só agradecimento
     if len(text) < 80:
         score -= 2
-    if any(p in text for p in ["obrigado", "agradecemos o contato", "à disposição", "a disposição", "estamos à disposição"]):
+    if any(p in text for p in ["obrigado", "agradecemos o contato", "à disposição", "a disposição"]):
         score -= 1
 
     return score
 
 
 def _build_clean_thread_text(thread_data: Dict[str, Any]) -> str:
-    """
-    Seleciona as mensagens mais relevantes do hotel na thread,
-    faz faxina e devolve um texto compacto para o LLM.
-    """
     messages = thread_data.get("messages") or []
     if not messages:
         return json.dumps(thread_data, ensure_ascii=False)
 
     msg_infos = []
-
     for idx, msg in enumerate(messages):
         payload = msg.get("payload", {}) or {}
         headers = payload.get("headers", []) or []
-
         from_email = _get_header(headers, "From")
         subject = _get_header(headers, "Subject")
         date = _get_header(headers, "Date")
-
         body_raw = _extract_body_from_payload(payload)
         body_clean = _strip_reply_history_and_signature(body_raw)
-
         score = _score_message(from_email, body_clean)
+        msg_infos.append({
+            "idx": idx, "from": from_email, "subject": subject,
+            "date": date, "score": score, "body": body_clean.strip(),
+        })
 
-        msg_infos.append(
-            {
-                "idx": idx,
-                "from": from_email,
-                "subject": subject,
-                "date": date,
-                "score": score,
-                "body": body_clean.strip(),
-            }
-        )
-
-    # header top-level (primeira mensagem da thread)
     top_msg = messages[0]
     top_headers = (top_msg.get("payload") or {}).get("headers", []) or []
-    top_from = _get_header(top_headers, "From")
-    top_subject = _get_header(top_headers, "Subject")
-    top_date = _get_header(top_headers, "Date")
-
     header_lines = [
-        f"TOP-LEVEL FROM: {top_from}",
-        f"TOP-LEVEL SUBJECT: {top_subject}",
-        f"TOP-LEVEL DATE: {top_date}",
+        f"TOP-LEVEL FROM: {_get_header(top_headers, 'From')}",
+        f"TOP-LEVEL SUBJECT: {_get_header(top_headers, 'Subject')}",
+        f"TOP-LEVEL DATE: {_get_header(top_headers, 'Date')}",
         "",
         "Abaixo, apenas as mensagens mais relevantes (hotel / fornecedor), já limpas:",
         "",
     ]
 
-    # filtra mensagens com score > 0 e corpo razoável
     selected = [m for m in msg_infos if m["score"] > 0 and len(m["body"]) > 40]
-
     if not selected:
-        # fallback: pega só a última mensagem não vazia
         non_empty = [m for m in msg_infos if m["body"]]
         if non_empty:
             selected = [sorted(non_empty, key=lambda x: x["idx"])[-1]]
         else:
-            # último fallback: devolve JSON bruto da thread
             return json.dumps(thread_data, ensure_ascii=False)
 
-    # ordena por score desc, depois ordem cronológica
-    selected = sorted(selected, key=lambda m: (-m["score"], m["idx"]))
-    selected = selected[:5]  # limite de segurança
+    selected = sorted(selected, key=lambda m: (-m["score"], m["idx"]))[:5]
 
     blocks = []
     for j, m in enumerate(selected, 1):
-        block = [
+        blocks.append("\n".join([
             f"--- MENSAGEM {j} ---",
             f"From: {m['from']}",
             f"Date: {m['date']}",
@@ -363,228 +282,146 @@ def _build_clean_thread_text(thread_data: Dict[str, Any]) -> str:
             "",
             m["body"],
             "",
-        ]
-        blocks.append("\n".join(block))
+        ]))
 
     return "\n".join(header_lines + blocks)
 
 
-# =====================================================
+# ---------------------------------------------------------------------------
 # ExtractorAgent
-# =====================================================
+# ---------------------------------------------------------------------------
 
 class ExtractorAgent:
-    def __init__(self):
-        self.bucket_name = settings.GCS_BUCKET
-        self.service_account_file = settings.SERVICE_ACCOUNT_FILE
-        self.state_path = "state/extractor_state.json"
-        self.state: Dict[str, Dict[str, Any]] = self._load_state()
+    def __init__(self) -> None:
+        self._state: Optional[Dict[str, Any]] = None
 
-    # ---------------------------
-    # Estado incremental
-    # ---------------------------
-    def _load_state(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Carrega o estado do extrator do GCS (ou {} se não existir).
-
-        Formato esperado (por thread_id):
-        {
-          "last_message_id": "...",
-          "last_row_count": 4,
-          "processed": true  # legado (opcional)
-        }
-        """
-        data = gcs_client.download_json(self.state_path)
+    def _load_state(self, gcs) -> Dict[str, Any]:
+        data = gcs.download_json(EXTRACTOR_STATE_PATH)
         if data is None or not isinstance(data, dict):
             return {}
         return data
 
-    def _save_state(self) -> None:
-        """Persiste o estado do extrator no GCS."""
-        gcs_client.upload_json(self.state_path, self.state)
-
-    def _is_up_to_date(self, thread_id: str, last_message_id: str) -> bool:
-        """
-        Retorna True se a thread não teve novos e-mails desde a última extração.
-
-        - Usa last_message_id salvo no estado.
-        - Se o estado for legado (sem last_message_id), retornamos False
-          para forçar uma primeira reextração com o novo modelo.
-        """
+    def _is_up_to_date(self, state: Dict[str, Any], thread_id: str, last_message_id: str) -> bool:
         if not last_message_id:
             return False
-
-        info = self.state.get(thread_id) or {}
-        stored = info.get("last_message_id") or ""
-
-        # Se não havia last_message_id antes (estado antigo), consideramos desatualizado
-        if not stored:
-            return False
-
+        stored = (state.get(thread_id) or {}).get("last_message_id") or ""
         return stored == last_message_id
 
-    def _mark_processed(self, thread_id: str, last_message_id: str, row_count: int) -> None:
-        """Marca uma thread como processada, armazenando o último message_id e contagem de linhas."""
-        self.state[thread_id] = {
-            "processed": True,           # mantido por compatibilidade / debug
-            "last_message_id": last_message_id,
-            "last_row_count": row_count,
-        }
+    def run(self) -> None:
+        gcs = make_gcs_client()
+        llm = make_llm_client()
+        state = self._load_state(gcs)
 
-    # ---------------------------
-    # Listar todos os JSONs em threads/
-    # ---------------------------
-    def list_thread_objects(self) -> List[str]:
-        client = storage.Client.from_service_account_json(self.service_account_file)
-        bucket = client.bucket(self.bucket_name)
+        blob_names = [b for b in gcs.list_blobs("threads/") if b.endswith(".json")]
+        logger.info("Encontrados %d arquivos em threads/", len(blob_names))
+        logger.info("Estado atual: %d threads já processadas.", len(state))
 
-        blobs = bucket.list_blobs(prefix="threads/")
-        return [b.name for b in blobs if b.name.endswith(".json")]
+        all_rows: List[Dict[str, Any]] = []
 
-    # ---------------------------
-    # Extrair cotações de UMA thread
-    # ---------------------------
-    def extract_thread(self, thread_id: str, thread_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        # agora mandamos para o LLM apenas as mensagens relevantes, já limpas
+        for blob_name in blob_names:
+            thread_id = _thread_id_from_blob_name(blob_name)
+            thread_data = gcs.download_json(blob_name)
+            if not thread_data:
+                logger.warning("Thread %s: arquivo vazio, pulando.", thread_id)
+                continue
+
+            messages = thread_data.get("messages") or []
+            if not messages:
+                logger.warning("Thread %s: sem mensagens, pulando.", thread_id)
+                continue
+
+            last_message_id = (messages[-1].get("id") or "").strip()
+
+            if self._is_up_to_date(state, thread_id, last_message_id):
+                logger.debug("Thread %s sem novos emails, pulando.", thread_id)
+                continue
+
+            logger.info("Extraindo thread %s...", thread_id)
+
+            try:
+                rows = self._extract_thread(thread_id, thread_data, llm, gcs)
+                logger.info("Thread %s: %d cotações extraídas.", thread_id, len(rows))
+                all_rows.extend(rows)
+                state[thread_id] = {
+                    "processed": True,
+                    "last_message_id": last_message_id,
+                    "last_row_count": len(rows),
+                }
+            except Exception as e:
+                logger.error("Erro ao extrair thread %s: %s", thread_id, e)
+
+        gcs.upload_json(EXTRACTOR_STATE_PATH, state)
+        logger.info("Extração concluída. Total de linhas novas: %d", len(all_rows))
+
+        gcs.upload_json("tables/quotes_raw.json", all_rows)
+        logger.info("tables/quotes_raw.json salvo.")
+
+        if all_rows:
+            self._update_history(gcs, all_rows)
+
+    def _extract_thread(
+        self,
+        thread_id: str,
+        thread_data: Dict[str, Any],
+        llm,
+        gcs,
+    ) -> List[Dict[str, Any]]:
         email_text = _build_clean_thread_text(thread_data)
-
         user_prompt = USER_PROMPT_TEMPLATE.format(
             fields_json=FIELDS_JSON,
             email_text=email_text,
         )
 
         try:
-            quotes = llm_client.extract_quotes(SYSTEM_PROMPT, user_prompt)
+            quotes = llm.extract_quotes(SYSTEM_PROMPT, user_prompt)
         except Exception as e:
             msg = str(e)
-            # tratamento especial para 400
             if "400 Client Error" in msg:
-                print(f"   ⚠️ [LLM-400] Erro 400 (Bad Request) ao chamar LLM para thread {thread_id}.")
-                debug_payload = {
-                    "thread_id": thread_id,
-                    "error": msg,
-                    # corta o prompt pra não ficar gigante no debug
-                    "user_prompt_head": user_prompt[:4000],
-                }
                 debug_path = f"state/extractor_llm_400_{thread_id}.json"
                 try:
-                    gcs_client.upload_json(debug_path, debug_payload)
-                    print(f"   📝 Debug do erro salvo em gs://{self.bucket_name}/{debug_path}")
-                except Exception as e2:
-                    print(f"   ⚠️ Falha ao salvar debug do erro 400: {e2}")
-            # propaga o erro para o chamador decidir se marca estado ou não
+                    gcs.upload_json(debug_path, {
+                        "thread_id": thread_id,
+                        "error": msg,
+                        "user_prompt_head": user_prompt[:4000],
+                    })
+                    logger.warning("Debug do erro 400 salvo em %s", debug_path)
+                except Exception:
+                    pass
             raise
 
         rows: List[Dict[str, Any]] = []
         for i, quote in enumerate(quotes):
-            # garante que todas as colunas existam
             row = {field: quote.get(field, "") for field in HEADER_FIELDS}
-
             row["_thread_id"] = thread_id
             row["_row_index_in_thread"] = i
             row["_key"] = _make_row_key(thread_id, row)
-
             rows.append(row)
 
         return rows
 
-    # ---------------------------
-    # Fluxo principal do agente
-    # ---------------------------
-    def run(self) -> None:
-        print("🟣 Iniciando ExtractorAgent (threads → tables/quotes_raw.json)")
+    def _update_history(self, gcs, new_rows: List[Dict[str, Any]]) -> None:
+        history_path = "tables/quotes_history.json"
+        existing = gcs.download_json(history_path)
+        if not isinstance(existing, list):
+            existing = []
 
-        blob_names = self.list_thread_objects()
-        print(f"→ Encontrados {len(blob_names)} arquivos em threads/")
-        print(f"→ Estado atual contém {len(self.state)} threads já vistas.")
+        by_key: Dict[str, Dict[str, Any]] = {
+            row["_key"]: row for row in existing if row.get("_key")
+        }
+        new_count = 0
+        for row in new_rows:
+            key = row.get("_key")
+            if key and key not in by_key:
+                by_key[key] = row
+                new_count += 1
 
-        all_rows: List[Dict[str, Any]] = []
-
-        for blob_name in blob_names:
-            thread_id = _thread_id_from_blob_name(blob_name)
-
-            thread_data = gcs_client.download_json(blob_name)
-            if not thread_data:
-                print(f"   ⚠️ Thread {thread_id}: arquivo vazio ou não encontrado, pulando.")
-                continue
-
-            messages = thread_data.get("messages") or []
-            if not messages:
-                print(f"   ⚠️ Thread {thread_id}: sem mensagens, pulando.")
-                continue
-
-            last_message_id = (messages[-1].get("id") or "").strip()
-
-            if self._is_up_to_date(thread_id, last_message_id):
-                print(f"⏭️  Thread {thread_id} sem novos emails desde a última extração, pulando.")
-                continue
-
-            print(f"📦 Processando thread {thread_id} ({blob_name})...")
-
-            try:
-                rows = self.extract_thread(thread_id, thread_data)
-                print(f"   → {len(rows)} cotações extraídas.")
-                all_rows.extend(rows)
-
-                # Marca como processada (mesmo que 0 linhas – LLM decidiu que não é cotação)
-                self._mark_processed(thread_id, last_message_id, len(rows))
-
-            except Exception as e:
-                # NÃO marca como processada em caso de erro, para tentar de novo na próxima execução
-                print(f"   ⚠️ Erro ao extrair thread {thread_id}: {e}")
-
-        # Salva estado atualizado
-        self._save_state()
-
-        print(f"✅ Extração concluída. Total de linhas novas nesta execução: {len(all_rows)}")
-
-        # --------------------------------------------------
-        # 1) STAGING: sobrescreve com apenas esta execução
-        # --------------------------------------------------
-        output_path = "tables/quotes_raw.json"
-        gcs_client.upload_json(output_path, all_rows)
-        print(f"📂 Tabela (parcial desta execução) salva em gs://{self.bucket_name}/{output_path}")
-
-        # --------------------------------------------------
-        # 2) HISTÓRICO: acumula tudo em tables/quotes_history.json
-        #    usando _key para não duplicar linhas
-        # --------------------------------------------------
-        if all_rows:
-            history_path = "tables/quotes_history.json"
-
-            # Tenta carregar o histórico existente
-            existing_history = gcs_client.download_json(history_path)
-            if not isinstance(existing_history, list):
-                existing_history = []
-
-            # Dict chave -> linha (mantém o que já existia e adiciona novos)
-            by_key: Dict[str, Dict[str, Any]] = {}
-
-            # 2.1. Mantém todas as linhas já existentes no histórico
-            for row in existing_history:
-                key = row.get("_key")
-                if key and key not in by_key:
-                    by_key[key] = row
-
-            # 2.2. Adiciona apenas linhas novas desta execução
-            new_count = 0
-            for row in all_rows:
-                key = row.get("_key")
-                if not key:
-                    # segurança extra: se, por algum bug, alguma linha vier sem _key, pula
-                    continue
-                if key not in by_key:
-                    by_key[key] = row
-                    new_count += 1
-
-            new_history = list(by_key.values())
-            gcs_client.upload_json(history_path, new_history)
-            print(
-                f"📚 Histórico atualizado em gs://{self.bucket_name}/{history_path} "
-                f"(novas linhas únicas: {new_count}, total acumulado: {len(new_history)})"
-            )
-        else:
-            print("ℹ️ Nenhuma linha nova nesta execução; histórico não foi modificado.")
+        gcs.upload_json(history_path, list(by_key.values()))
+        logger.info(
+            "Histórico atualizado: %d novas linhas únicas, %d total.",
+            new_count,
+            len(by_key),
+        )
 
 
-extractor_agent = ExtractorAgent()
+def run_extractor() -> None:
+    ExtractorAgent().run()
