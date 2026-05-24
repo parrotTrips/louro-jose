@@ -1,7 +1,7 @@
+credentials/
+.env
 env/
 __pycache__/
 *.pyc
-credentials/*.json
-tokens/*.json
-
-.env
+*.pyo
+.DS_Store
