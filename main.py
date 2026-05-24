@@ -1,18 +1,30 @@
-# main.py
-from app.agents.labeler_storage_agent import labeler_storage_agent
-from app.agents.extractor_agent import extractor_agent
-from app.agents.sheets_sync_agent import sheets_sync_agent
+import logging
+
+from app.agents.storage_agent import run_storage
+from app.agents.extractor_agent import run_extractor
+from app.agents.sheets_sync_agent import run_sheets_sync
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    )
+
+    logging.info("STEP 1/3 — StorageAgent (Gmail QUOTES → GCS)...")
+    run_storage()
+    logging.info("STEP 1/3 — OK")
+
+    logging.info("STEP 2/3 — ExtractorAgent (GCS → LLM → tables)...")
+    run_extractor()
+    logging.info("STEP 2/3 — OK")
+
+    logging.info("STEP 3/3 — SheetsSyncAgent (tables → Google Sheets)...")
+    run_sheets_sync()
+    logging.info("STEP 3/3 — OK")
+
+    logging.info("Pipeline concluído com sucesso.")
 
 
 if __name__ == "__main__":
-    # 🔵 Etapa 1: Labeler + Storage (opcional, por enquanto vamos deixar comentado)
-    # print("🔵 Rodando Labeler + Storage (Gmail → QUOTES → threads/ + state/threads_state.json)")
-    # labeler_storage_agent.run()
-
-    # 🟣 Etapa 2: Extrator (threads/ → tables/quotes_raw.json + state/extractor_state.json)
-    print("🟣 Rodando ExtractorAgent (threads/ → tables/quotes_raw.json + state/extractor_state.json)")
-    extractor_agent.run()
-
-    # 📊 Etapa 3: Sync para Google Sheets (tables/quotes_raw.json → planilha)
-    print("📊 Rodando SheetsSyncAgent (tables/quotes_raw.json → Google Sheets)")
-    sheets_sync_agent.run()
+    main()
