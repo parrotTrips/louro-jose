@@ -1,0 +1,12 @@
+credentials/
+scripts/
+env/
+.env
+.git
+__pycache__
+*.pyc
+*.pyo
+.DS_Store
+docs/
+tests/
+requirements-dev.txt

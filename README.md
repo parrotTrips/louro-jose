@@ -1,256 +1,188 @@
-Gmail Threads Dumper — Documentação do Projeto
+# Louro José — Pipeline Gmail → GCS → Google Sheets
 
-==============================================
+Pipeline de cotações de viagem executado como Cloud Run Job, 2x por dia.
 
-Este repositório implementa um MVP simples e modular para:
-1. Autenticar no Gmail via OAuth;
-2. Listar rótulos (labels) da caixa de entrada (teste rápido);
-3. Buscar mensagens por rótulo e/ou consulta (--q), agrupar por thread e salvar 1 JSON por thread em raw_messages/.
-4. Extrair informações dessas mensagens com uma LLM e enquadrar nos campos do cabeçalho da aba quotes;
-5. Persistir os dados extraídos na planilha do Google Sheets indicada no .env.
+## Visão geral
 
--------------------------------------------------------------------------------
-1) Estrutura de Pastas e Papéis de Cada Arquivo
--------------------------------------------------------------------------------
+O `main.py` roda três agentes em sequência:
 
-.
-├── credentials/
-│   └── real-credentials-parrots-gmail.json
-│      → Credenciais OAuth do Google obtidas no Google Cloud Console (Client ID/Secret).
-│        Este arquivo é usado apenas localmente para iniciar o fluxo de autorização.
-│
-├── raw_messages/
-│   → Pasta onde serão salvos os JSONs resultantes (um arquivo por thread do Gmail).
-│
-├── outputs/
-│   → (Novo) Artefatos das fases de extração e persistência:
-│      - quotes_extracted.jsonl  (saída da extração via LLM, 1 JSON por linha)
-│      - quotes_extracted.csv    (opcional, se decidir gerar CSV)
-│
-├── token_files/
-│   → Pasta onde ficará o token de acesso/refresh gerado após o primeiro login (OAuth).
-│     O arquivo padrão é `token_gmail_v1.json`. Se apagado, o login será solicitado novamente.
-│
-├── utils/
-│   ├── __init__.py
-│   │  → Arquivo vazio para tornar `utils` um pacote Python importável.
-│   │
-│   ├── mime.py
-│   │  → Funções utilitárias para lidar com MIME:
-│   │     - `get_header(...)`: obtém um header específico (ex.: From, To, Subject).
-│   │     - `extract_prefer_plaintext(...)`: extrai o corpo preferindo `text/plain`; se não existir,
-│   │       converte `text/html` em texto legível (remove scripts/styles e normaliza quebras de linha).
-│   │     - Helpers para decodificar Base64URL e percorrer partes MIME recursivamente.
-│   │
-│   ├── gmail_query.py
-│   │  → Funções para conversar com a Gmail API em alto nível:
-│   │     - `find_label_id(...)`: resolve o ID de um rótulo pelo nome (ex.: "QUOTES").
-│   │     - `list_messages(...)`: lista mensagens respeitando rótulos, query e paginação.
-│   │     - `get_thread(...)`: busca o conteúdo completo de uma thread (todas as mensagens).
-│   │     - `simplify_message(...)`: reduz cada mensagem para um dicionário padrão:
-│   │       { timestamp (ISO São Paulo), sender, recipient, subject, body }
-│   │     - `build_gmail_query(...)`: compõe a string de busca (q/after/before).
-│   │     - `unique_thread_ids(...)`: deduplica mensagens por thread preservando ordem.
-│   │
-│   ├── headers.py
-│   │  → (Novo) Lista **única e ordenada** dos 15 campos do cabeçalho da aba `quotes`.
-│   │
-│   ├── prompt.py
-│   │  → (Novo) Instruções do sistema (`SYSTEM_INSTRUCTIONS`) e gerador de prompt
-│   │     (`build_user_prompt(...)`) para a LLM.
-│   │
-│   ├── text_clean.py
-│   │  → (Novo) Limpeza do corpo do e-mail (remove “forwarded”, cabeçalhos repetidos, links/assinaturas).
-│   │
-│   ├── io_email.py
-│   │  → (Novo) Carrega os JSONs de `raw_messages/` (formato com `emails[0]` ou “flat”)
-│   │     e infere timestamp a partir do nome do arquivo quando necessário.
-│   │
-│   └── json_utils.py
-│      → (Novo) Utilitários genéricos: `force_json_object(...)`, `blank_row(...)`, `ensure_dir(...)`.
-│
-├── login_gmail.py
-│  → Responsável pela autenticação (OAuth) e criação do cliente Gmail:
-│    - Usa `credentials/real-credentials-parrots-gmail.json` e salva/renova token em `token_files/token_gmail_v1.json`.
-│    - Escopo padrão: `https://www.googleapis.com/auth/gmail.readonly`.
-│
-├── list_labels.py
-│  → Script de verificação rápida:
-│    - Realiza login e imprime todos os rótulos disponíveis da conta (para validar acesso).
-│
-├── dump_threads.py
-│  → Script principal de coleta:
-│    - Parâmetros:
-│      --label "NOME_DO_ROTULO"   (ex.: QUOTES)  [opcional]
-│      --q     "consulta gmail"   (ex.: from:foo@bar.com has:attachment)  [opcional]
-│      --after YYYY/MM/DD         (ex.: 2025/08/01)  [opcional]
-│      --before YYYY/MM/DD        (ex.: 2025/08/13)  [opcional]
-│      --max   500                (quantidade máx. de mensagens a varrer; não de threads)
-│    - Faz a busca, agrupa por thread e salva 1 arquivo JSON por thread em `raw_messages/`.
-│    - Converte HTML para texto quando não houver `text/plain`.
-│
-├── llm_extract_quotes.py
-│  → (Novo) **Fase 1** — Extração via LLM:
-│    - Lê `raw_messages/*.json`, limpa o corpo e chama o Gemini (API Key no `.env`).
-│    - Enquadra os dados **exatamente** nos 15 campos da aba `quotes`.
-│    - Salva `outputs/quotes_extracted.jsonl` (um objeto JSON por linha).
-│
-└── save_quotes_to_csv.py
-   → (Novo) **Fase 2** — Persistência:
-     - Lê `outputs/quotes_extracted.jsonl` e **faz append na aba `quotes`** da planilha
-       indicada por `SHEET_ID` (no `.env`) usando `utils/login_sheets`.
-     - (Opcional) pode ser adaptado para também gerar `outputs/quotes_extracted.csv`.
+1. **StorageAgent** — lê threads do Gmail com label `QUOTES` e salva no GCS
+2. **ExtractorAgent** — lê threads do GCS, chama LLM, salva cotações estruturadas no GCS
+3. **SheetsSyncAgent** — lê cotações do GCS e sincroniza na planilha Google Sheets
 
+A classificação de emails **não usa LLM**: quem aplica o label `QUOTES` são filtros nativos do Gmail (criados por `scripts/setup_gmail_filters.py`).
 
+## Fluxo de dados
 
--------------------------------------------------------------------------------
-2) Pré-requisitos
--------------------------------------------------------------------------------
+```
+Gmail (threads com label QUOTES)
+  → GCS  threads/<thread_id>.json
+         state/threads_state.json
+  → LLM (ExtractorAgent)
+  → GCS  tables/quotes_raw.json
+         tables/quotes_history.json
+  → Google Sheets (aba quotes_raw)
+```
 
-- Ter o arquivo de credenciais OAuth do Google salvo em:
-  `credentials/real-credentials-parrots-gmail.json`
-- Ter credentials/sheets-parrots.json
-- Ter um GEMINI_API_KEY no arquivo dotenv
+## Agendamento
 
-Variáveis de ambiente:
+Cloud Run Job (`louro-jose-job`), disparado pelo Cloud Scheduler:
 
-# LLM (Gemini)
-GEMINI_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxx
-GEMINI_MODEL_NAME=gemini-1.5-flash   # opcional (pode usar gemini-1.5-pro)
+- `12:00` (horário conforme timezone configurado no Scheduler)
+- `17:00`
 
-# Google Sheets
-SHEET_ID=1AbCDeFGhiJKlmnOPqRS_tuvWxYZ1234567890
+Em cada disparo, o pipeline completo é executado do início ao fim.
 
+## O que cada agente faz
 
--------------------------------------------------------------------------------
-3) Instalação (primeira vez)
--------------------------------------------------------------------------------
+### 1) StorageAgent (`app/agents/storage_agent.py`)
 
-1. Crie e ative o ambiente virtual:
-   - macOS/Linux:
-     ```
-     python3 -m venv env
-     source env/bin/activate
-     ```
-   - Windows (PowerShell):
-     ```
-     py -m venv env
-     .\env\Scripts\Activate.ps1
-     ```
+- Lista todas as threads Gmail com o label `QUOTES` (com paginação completa).
+- Para cada thread, compara o `last_message_id` com `state/threads_state.json`.
+- Se houver novidade, salva `threads/<thread_id>.json` no GCS e atualiza o estado.
 
-2. Instale as dependências:
- ```
- pip install -r requirements.txt
- ```
+Resultado: GCS atualizado com threads novas ou modificadas; nenhuma chamada LLM.
 
-3. Primeiro teste: listar rótulos (labels)
-------------------------------------------
-$ python3 list_labels.py
+### 2) ExtractorAgent (`app/agents/extractor_agent.py`)
 
-O que acontece:
-- Na primeira execução, abre-se uma janela do navegador para você autorizar o acesso somente-leitura ao Gmail (escopo: https://www.googleapis.com/auth/gmail.readonly).
-- Ao autorizar, um token é salvo em: token_files/token_gmail_v1.json.
-- Nas próximas execuções, o token é reutilizado e renovado automaticamente sem pedir login.
-- A saída esperada é uma lista de rótulos, por exemplo:
-  📬 Rótulos encontrados:
-   - INBOX
-   - SENT
-   - QUOTES
-   - ...
+- Lista todos os arquivos em `threads/*.json` no GCS.
+- Para cada thread, verifica `state/extractor_state.json` e pula se não houve mudança.
+- Chama o LLM para extrair campos estruturados de cotação.
+- Salva:
+  - `tables/quotes_raw.json` — lote da execução atual
+  - `tables/quotes_history.json` — histórico acumulado (deduplicado por `_key`)
 
-Se quiser forçar um novo login (ou trocar de conta), apague o arquivo:
-  token_files/token_gmail_v1.json
-e rode novamente o list_labels.py.
+### 3) SheetsSyncAgent (`app/agents/sheets_sync_agent.py`)
 
-3) Coleta: salvar 1 JSON por thread (dump)
-------------------------------------------
-Exemplo por rótulo + janela de datas:
-$ python3 dump_threads.py --label QUOTES --after 2025/08/01 --before 2025/08/13 --max 200
+- Lê `tables/quotes_raw.json` do GCS.
+- Abre a planilha configurada por `SHEETS_SPREADSHEET_ID` (aba `SHEETS_QUOTE_SHEET_NAME`).
+- Garante cabeçalho da aba.
+- Faz append apenas das linhas cujo `_key` ainda não existe na planilha.
 
-Exemplo por consulta livre (sem rótulo):
-$ python3 dump_threads.py --q "from:alguem@empresa.com subject:cotação" --max 100
+## Credenciais
 
-Exemplo combinando rótulo e consulta:
-$ python3 dump_threads.py --label QUOTES --q "from:alguem@empresa.com" --max 200
+Dois arquivos em `credentials/` (não commitado no repositório):
 
-O que acontece:
-- O script monta a busca usando os parâmetros fornecidos:
-  • --label: restringe a mensagens com o rótulo informado (ex.: QUOTES).
-  • --q: passa a consulta conforme a sintaxe de busca do Gmail (ex.: from:, to:, subject:, has:attachment, etc.).
-  • --after e --before: filtros de data no formato YYYY/MM/DD (padrão do Gmail).
-    - Regra prática: after:D/ M/ A significa “mais recentes que essa data” (exclusivo).
-      before:D/ M/ A significa “mais antigas que essa data” (exclusivo).
-    - Ex.: after:2025/08/01 AND before:2025/08/13 cobre aproximadamente 2025-08-01 até 2025-08-12.
-  • --max: limita a quantidade de MENSAGENS escaneadas na busca (não é o número final de threads).
-- As mensagens encontradas são agrupadas por threadId.
-- Para cada thread:
-  • Baixa-se o conteúdo completo da thread (todas as mensagens).
-  • Cada mensagem é simplificada para {timestamp, sender, recipient, subject, body}.
-  • O corpo (body) prioriza text/plain; se indisponível, converte-se text/html para texto limpo.
-  • As mensagens são ordenadas cronologicamente.
-  • Gera-se um arquivo JSON por thread em raw_messages/.
+| Arquivo | Descrição |
+|---|---|
+| `gmail-token.json` | Token OAuth 2.0 do Gmail — gerado por `scripts/generate_gmail_token.py` |
+| `service-account.json` | Service Account com acesso ao GCS e Google Sheets |
 
-4. Onde ver os resultados
--------------------------
-- Os arquivos são gravados em: raw_messages/
-- Nome do arquivo:
-  YYYYMMDD_HHMM__Nome_Email__Assunto.json
-  • YYYYMMDD_HHMM vem do timestamp da primeira mensagem da thread (timezone São Paulo).
-  • Nome_Email é baseado no header “From”.
-  • Assunto é sanitizado para formar um nome de arquivo seguro.
-- Exemplo para inspecionar rapidamente:
-  $ ls -1 raw_messages | head
-  $ cat raw_messages/20250808_1241__Fulano_fulano@exemplo.com__Assunto.json
+No Cloud Run, esses arquivos são montados via volume mounts (ver seção de setup).
 
-5. Fluxo geral (visão resumida)
--------------------------------
-- login_gmail.py: faz OAuth; cria/renova token; retorna o cliente Gmail autenticado.
-- list_labels.py: sanity check — mostra os rótulos disponíveis.
-- dump_threads.py:
-  1) (Opcional) resolve o ID do rótulo informado.
-  2) Monta a query (q/after/before) para a Gmail API.
-  3) Lista mensagens (até --max), agrupa por threadId.
-  4) Para cada thread, busca conteúdo completo, simplifica mensagens e salva 1 JSON em raw_messages/.
-- utils/mime.py: lida com MIME, headers e conversão HTML→texto.
-- utils/gmail_query.py: utilitários para busca, threads e normalização de mensagens.
+## Variáveis de ambiente
 
-6. Exemplos úteis de consultas (parâmetro --q)
-----------------------------------------------
-- Por remetente:
-  --q "from:alguem@empresa.com"
-- Por assunto contendo palavras:
-  --q "subject:cotação"
-- E-mails com anexos:
-  --q "has:attachment"
-- Múltiplas condições:
-  --q "from:alguem@empresa.com subject:paraty has:attachment"
+Ver `.env.example`. Variáveis principais:
 
-7. Fase 1 — Extração via LLM (Gemini)
--------------------------------------
-Execução:
-`$ python3 llm_extract_quotes.py`
+| Variável | Descrição |
+|---|---|
+| `GCP_PROJECT_ID` | ID do projeto GCP |
+| `GCS_BUCKET` | Nome do bucket GCS |
+| `GMAIL_LABEL` | Label Gmail a monitorar (padrão: `QUOTES`) |
+| `GMAIL_TOKEN_FILE` | Caminho para `gmail-token.json` (padrão: `credentials/gmail-token.json`) |
+| `SERVICE_ACCOUNT_FILE` | Caminho para `service-account.json` (padrão: `credentials/service-account.json`) |
+| `OPENAI_API_KEY` | Chave da API OpenAI |
+| `OPENAI_BASE_URL` | URL base da API (padrão: `https://api.openai.com/v1`) |
+| `OPENAI_MODEL` | Modelo a usar (padrão: `gpt-4o`) |
+| `SHEETS_SPREADSHEET_ID` | ID da planilha Google Sheets |
+| `SHEETS_QUOTE_SHEET_NAME` | Nome da aba de destino (padrão: `quotes_raw`) |
 
-O que acontece:
+## Arquivos no bucket GCS
 
-- Para cada arquivo em raw_messages/, o corpo é higienizado (remoção de “Forwarded message”, cabeçalhos repetidos, links/assinaturas).
-- O modelo Gemini recebe metadados (timestamp, destinatário, assunto, remetente) e o corpo limpo.
-- A LLM enquadra as informações exatamente nos 15 campos da aba quotes, retornando um JSON por e-mail.
-- O script salva um JSON por linha em outputs/quotes_extracted.jsonl.
-- Observações:
-- Quando alguma informação não existe no e-mail, é gravada como "" (string vazia).
-- O script reforça timestamp/destinatário/assunto a partir dos metadados caso a LLM deixe em branco.
+```
+threads/<thread_id>.json       # thread completa do Gmail
+state/threads_state.json       # estado incremental do StorageAgent
+state/extractor_state.json     # estado incremental do ExtractorAgent
+tables/quotes_raw.json         # lote da última execução
+tables/quotes_history.json     # histórico acumulado de todas as execuções
+```
 
-8. Fase 2 — Persistência na Planilha (aba quotes)
--------------------------------------------------
-Execução:
-`$ python3 save_quotes_to_csv.py`
+## Execução local
 
-O que acontece:
+```bash
+python main.py
+```
 
-- Lê outputs/quotes_extracted.jsonl.
-- Confere o cabeçalho atual da aba quotes (somente avisa se estiver diferente).
-- Converte cada objeto JSON em uma linha na ordem do cabeçalho e faz append na aba quotes.
-- Possíveis avisos/erros:
-- Cabeçalho diferente: o script apenas alerta e continua o append.
-- 403/permiso: compartilhe a planilha com o e-mail da service account.
-- SHEET_ID vazio: defina no .env.
+## Desenvolvimento local
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/ -v
+```
+
+## Setup inicial (uma vez)
+
+Passos necessários antes do primeiro deploy ou ao renovar credenciais.
+
+### 1. Publicar o OAuth app no Google Cloud Console
+
+No Console GCP → APIs & Services → OAuth consent screen → Publishing status → **Publish App**.
+
+Enquanto o app estiver em modo "Testing", o token Gmail expira em 7 dias. Em modo "In production", a validade é de 6 meses (com refresh automático).
+
+### 2. Gerar o token Gmail
+
+```bash
+python scripts/generate_gmail_token.py
+```
+
+Isso abre o fluxo OAuth no navegador e salva `credentials/gmail-token.json`.
+
+### 3. Atualizar o Secret Manager com o novo token
+
+```bash
+gcloud secrets versions add gmail-token \
+  --data-file=credentials/gmail-token.json \
+  --project=louro-jose-479223
+```
+
+### 4. Criar filtros Gmail e fazer varredura retroativa
+
+```bash
+python scripts/setup_gmail_filters.py --lookback-days 180
+```
+
+Cria os filtros nativos do Gmail que aplicam `QUOTES` automaticamente em emails novos.
+O flag `--lookback-days` aplica o label retroativamente nos emails dos últimos N dias.
+
+### 5. Reconfigurar o Cloud Run Job
+
+Os secrets que contêm `/` no nome precisam ser montados como arquivos (volume mounts), não como env vars. Execute o comando abaixo para reconfigurar o job:
+
+```bash
+gcloud run jobs update louro-jose-job \
+  --region=us-central1 \
+  --project=louro-jose-479223 \
+  --set-env-vars="GCP_PROJECT_ID=louro-jose-479223,GCS_BUCKET=parrot-agents-dev,GMAIL_LABEL=QUOTES,SHEETS_SPREADSHEET_ID=1ukVazqwLD771HVpyEz4Edb9E8w3Bdqe_6tXlujTe5LI,SHEETS_QUOTE_SHEET_NAME=quotes_raw,OPENAI_BASE_URL=https://api.openai.com/v1,OPENAI_MODEL=gpt-4o,GMAIL_TOKEN_FILE=/secrets/gmail-token.json,SERVICE_ACCOUNT_FILE=/secrets/service-account.json" \
+  --set-secrets="OPENAI_API_KEY=openai-api-key:latest,/secrets/gmail-token.json=gmail-token:latest,/secrets/service-account.json=service-account-json:latest"
+```
+
+### 6. Build e deploy da imagem
+
+```bash
+gcloud builds submit \
+  --tag gcr.io/louro-jose-479223/louro-jose:latest \
+  --project=louro-jose-479223 .
+
+gcloud run jobs update louro-jose-job \
+  --image gcr.io/louro-jose-479223/louro-jose:latest \
+  --region=us-central1 \
+  --project=louro-jose-479223
+```
+
+### 7. Executar manualmente para validar
+
+```bash
+gcloud run jobs execute louro-jose-job \
+  --region=us-central1 \
+  --project=louro-jose-479223 \
+  --wait
+```
+
+## Comportamento incremental
+
+- **StorageAgent**: só regrava thread no GCS quando há novo `last_message_id`.
+- **ExtractorAgent**: só reextrai thread quando o último email mudou.
+- **SheetsSyncAgent**: só adiciona linha se o `_key` ainda não existe na planilha.
+
+Isso reduz custo de LLM, evita reprocessamento desnecessário e garante idempotência entre as execuções das 12h e 17h.
