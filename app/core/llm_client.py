@@ -1,82 +1,35 @@
-# app/core/llm_client.py
-
 import json
+import re
+import logging
+from typing import Any, Dict, List
+
 import requests
+
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _strip_markdown_fences(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r'^```(?:json)?\s*', '', text)
+    text = re.sub(r'\s*```$', '', text)
+    return text.strip()
 
 
 class LLMClient:
-    def __init__(self):
-        self.api_key = settings.OPENROUTER_API_KEY
-        self.base_url = settings.OPENROUTER_BASE_URL
-        self.model = settings.OPENROUTER_MODEL
+    def __init__(self, api_key: str, base_url: str, model: str) -> None:
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
 
-    # ------------------------------------------------------------------
-    # 1) Classificador simples: VIAGEM / NAO-VIAGEM  (já existia)
-    # ------------------------------------------------------------------
-    def classify_email(self, text: str) -> str:
-        """
-        Envia o texto do email para o LLM e retorna 'VIAGEM' ou 'NAO-VIAGEM'.
-        """
-        prompt = f"""
-Você é um classificador de emails.
-
-Responda APENAS com uma das opções:
-
-- VIAGEM
-- NAO-VIAGEM
-
-Essa classificação deve identificar emails que são:
-- cotações de hotel
-- mensagens de fornecedores de hospedagem
-- respostas sobre disponibilidade, tarifas, política de cancelamento
-- temas relacionados a viagens
-
-Email:
-{text}
-"""
-
-        headers = {
+    def _headers(self) -> Dict[str, str]:
+        return {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
 
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
-        }
-
-        response = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=30,
-        )
-        response.raise_for_status()
-        response_json = response.json()
-        raw = response_json["choices"][0]["message"]["content"].strip().upper()
-
-        # Sanitizar resposta
-        if "VIAGEM" in raw:
-            return "VIAGEM"
-        return "NAO-VIAGEM"
-
-    # ------------------------------------------------------------------
-    # 2) Novo: extrair cotações em formato JSON (lista de objetos)
-    # ------------------------------------------------------------------
-    def extract_quotes(self, system_prompt: str, user_prompt: str):
-        """
-        Usa o LLM para extrair cotações em formato JSON (array de objetos).
-
-        Retorna uma lista de dicionários Python.
-        """
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
+    def extract_quotes(self, system_prompt: str, user_prompt: str) -> List[Dict[str, Any]]:
         payload = {
             "model": self.model,
             "messages": [
@@ -85,30 +38,23 @@ Email:
             ],
             "temperature": 0.0,
         }
-
-        response = requests.post(
+        resp = requests.post(
             f"{self.base_url}/chat/completions",
-            headers=headers,
+            headers=self._headers(),
             json=payload,
             timeout=60,
         )
-        response.raise_for_status()
-        response_json = response.json()
-        content = response_json["choices"][0]["message"]["content"]
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
 
-        # Remover possíveis crases ``` e rótulo ```json
-        text = content.strip()
-        if text.startswith("```"):
-            # remove blocos tipo ```json ... ```
-            text = text.strip("`").strip()
-            if text.lower().startswith("json"):
-                text = text[4:].strip()
+        text = _strip_markdown_fences(content)
 
         try:
             data = json.loads(text)
         except json.JSONDecodeError as e:
-            # Em produção, ideal logar esse erro e talvez salvar o raw.
-            raise RuntimeError(f"Falha ao parsear JSON do LLM: {e}\nConteúdo: {text[:500]}")
+            raise RuntimeError(
+                f"Falha ao parsear JSON do LLM: {e}\nConteúdo: {text[:500]}"
+            )
 
         if not isinstance(data, list):
             raise RuntimeError("A resposta do LLM não é um array JSON.")
@@ -116,4 +62,9 @@ Email:
         return data
 
 
-llm_client = LLMClient()
+def make_llm_client() -> LLMClient:
+    return LLMClient(
+        api_key=settings.OPENAI_API_KEY,
+        base_url=settings.OPENAI_BASE_URL,
+        model=settings.OPENAI_MODEL,
+    )
